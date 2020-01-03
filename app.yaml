@@ -1,0 +1,4 @@
+runtime: go112
+entrypoint: /prebid-server
+env_variables:
+  port: 8080
