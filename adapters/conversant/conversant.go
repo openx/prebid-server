@@ -10,6 +10,7 @@ import (
 
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/adapters"
+	"github.com/prebid/prebid-server/errortypes"
 	"github.com/prebid/prebid-server/pbs"
 	"golang.org/x/net/context/ctxhttp"
 )
@@ -44,7 +45,7 @@ type conversantParams struct {
 
 func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidder *pbs.PBSBidder) (pbs.PBSBidSlice, error) {
 	mediaTypes := []pbs.MediaType{pbs.MEDIA_TYPE_BANNER, pbs.MEDIA_TYPE_VIDEO}
-	cnvrReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), mediaTypes, true)
+	cnvrReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), mediaTypes)
 
 	if err != nil {
 		return nil, err
@@ -54,7 +55,7 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 	// and response parsing.
 
 	impMap := make(map[string]*openrtb.Imp, len(cnvrReq.Imp))
-	for idx, _ := range cnvrReq.Imp {
+	for idx := range cnvrReq.Imp {
 		impMap[cnvrReq.Imp[idx].ID] = &cnvrReq.Imp[idx]
 	}
 
@@ -71,22 +72,29 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 
 		err := json.Unmarshal(unit.Params, &params)
 		if err != nil {
-			return nil, err
+			return nil, &errortypes.BadInput{
+				Message: err.Error(),
+			}
 		}
 
 		// Fill in additional Site info
-
 		if params.SiteID != "" {
-			cnvrReq.Site.ID = params.SiteID
+			if cnvrReq.Site != nil {
+				cnvrReq.Site.ID = params.SiteID
+			}
+			if cnvrReq.App != nil {
+				cnvrReq.App.ID = params.SiteID
+			}
 		}
 
-		if params.Mobile != nil {
+		if params.Mobile != nil && !(cnvrReq.Site == nil) {
 			cnvrReq.Site.Mobile = *params.Mobile
 		}
 
 		// Fill in additional impression info
 
 		imp.DisplayManager = "prebid-s2s"
+		imp.DisplayManagerVer = "1.0.1"
 		imp.BidFloor = params.BidFloor
 		imp.TagID = params.TagID
 
@@ -109,7 +117,7 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 
 			// Include protocols, mimes, and max duration if specified
 			// These properties can also be specified in ad unit's video object,
-			// but are overriden if the custom params object also contains them.
+			// but are overridden if the custom params object also contains them.
 
 			if len(params.Protocols) > 0 {
 				imp.Video.Protocols = make([]openrtb.Protocol, 0, len(params.Protocols))
@@ -137,8 +145,16 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 
 	// Do a quick check on required parameters
 
-	if cnvrReq.Site.ID == "" {
-		return nil, fmt.Errorf("Missing site id")
+	if cnvrReq.Site != nil && cnvrReq.Site.ID == "" {
+		return nil, &errortypes.BadInput{
+			Message: "Missing site id",
+		}
+	}
+
+	if cnvrReq.App != nil && cnvrReq.App.ID == "" {
+		return nil, &errortypes.BadInput{
+			Message: "Missing app id",
+		}
 	}
 
 	// Start capturing debug info
@@ -185,8 +201,16 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusBadRequest {
+		return nil, &errortypes.BadInput{
+			Message: fmt.Sprintf("HTTP status: %d, body: %s", resp.StatusCode, string(body)),
+		}
+	}
+
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP status: %d, body: %s", resp.StatusCode, string(body))
+		return nil, &errortypes.BadServerResponse{
+			Message: fmt.Sprintf("HTTP status: %d, body: %s", resp.StatusCode, string(body)),
+		}
 	}
 
 	if req.IsDebug {
@@ -197,7 +221,9 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 
 	err = json.Unmarshal(body, &bidResp)
 	if err != nil {
-		return nil, err
+		return nil, &errortypes.BadServerResponse{
+			Message: err.Error(),
+		}
 	}
 
 	bids := make(pbs.PBSBidSlice, 0)
@@ -211,12 +237,16 @@ func (a *ConversantAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 			imp := impMap[bid.ImpID]
 			if imp == nil {
 				// All returned bids should have a matching impression
-				return nil, fmt.Errorf("Unknown impression id '%s'", bid.ImpID)
+				return nil, &errortypes.BadServerResponse{
+					Message: fmt.Sprintf("Unknown impression id '%s'", bid.ImpID),
+				}
 			}
 
 			bidID := bidder.LookupBidID(bid.ImpID)
 			if bidID == "" {
-				return nil, fmt.Errorf("Unknown ad unit code '%s'", bid.ImpID)
+				return nil, &errortypes.BadServerResponse{
+					Message: fmt.Sprintf("Unknown ad unit code '%s'", bid.ImpID),
+				}
 			}
 
 			pbsBid := pbs.PBSBid{

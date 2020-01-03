@@ -1,6 +1,9 @@
 # Adding a New Bidder
 
-This document describes how to add a new Bidder to Prebid Server.
+This document describes how to add a new Bidder to Prebid Server. Bidders are responsible for reaching out to your Server to fetch Bids.
+
+**NOTE**: To make everyone's lives easier, Bidders are expected to make Net bids (e.g. "If this ad wins, what will the publisher make?), not Gross ones.
+Publishers can correct for Gross bids anyway by setting [Bid Adjustments](../endpoints/openrtb2/auction.md#bid-adjustments) to account for fees.
 
 ## Choose a Bidder Name
 
@@ -23,12 +26,25 @@ Bidder implementations are scattered throughout several files.
 
 - `adapters/{bidder}/{bidder}.go`: contains an implementation of [the Bidder interface](../../adapters/bidder.go).
 - `openrtb_ext/imp_{bidder}.go`: contract classes for your Bidder's params.
-- `usersync/{bidder}.go`: A [Usersyncer](../../usersync/usersync.go) which returns cookie sync info for your bidder.
-- `usersync/{bidder}_test.go`: Unit tests for your Usersyncer
+- `usersync/usersyncers/{bidder}.go`: A [Usersyncer](../../usersync/usersync.go) which returns cookie sync info for your bidder.
+- `usersync/usersyncers/{bidder}_test.go`: Unit tests for your Usersyncer
 - `static/bidder-params/{bidder}.json`: A [draft-4 json-schema](https://spacetelescope.github.io/understanding-json-schema/) which [validates your Bidder's params](https://www.jsonschemavalidator.net/).
 - `static/bidder-info/{bidder}.yaml`: contains metadata (e.g. contact email, platform & media type support) about the adapter
 
 Bidder implementations may assume that any params have already been validated against the defined json-schema.
+
+### Long form video support
+If bidder is going to support long form video make sure bidder has:
+
+| Field          |Type                           |Description                       
+|----------------|-------------------------------|-----------------------------|
+|bid.bidVideo.PrimaryCategory | string | Category for the bid. Should be able to be translated to Primary ad server format|           
+|TypedBid.bid.Cat | []string | Category for the bid. Should be an array with length 1 containing the value in IAB format|            
+|TypedBid.BidVideo.Duration | int | AD duration in seconds|
+|TypedBid.bid.Price | float | Bid price|
+
+Note: `bid.bidVideo.PrimaryCategory` or `TypedBid.bid.Cat` should be specified.
+To learn more about IAB categories, please refer to this convenience link (not the final official definition): [IAB categories](https://adtagmacros.com/list-of-iab-categories-for-advertisement/)
 
 ## Test Your Bidder
 
@@ -46,7 +62,7 @@ This comes with several benefits, which are described in the source code docs.
 If your HTTP requests don't use JSON, you'll need to write your tests in the code.
 We expect to see at least 90% code coverage on each Bidder.
 
-Bidders should also define a `adapters/{bidder}/{bidder}test/params/race/{mediaType}.json` file for any supported
+Bidders should also define an `adapters/{bidder}/{bidder}test/params/race/{mediaType}.json` file for any supported
 Media Types (banner, video, audio, or native). These files should contain a JSON object with all the bidder params
 (required & optional) which are expected in supporting that video type. This will be used in automated tests which
 check for race conditions across Bidders.
@@ -78,3 +94,14 @@ Update the [NewSyncerMap function](../../usersync/usersync.go) to make your Bidd
 ## Contribute
 
 Finally, [Contribute](contributing.md) your Bidder to the project.
+
+## Server requirements
+
+**Note**: In order to be part of the auction, all bids must include:
+
+- An ID
+- An ImpID which matches one of the `Imp[i].ID`s from the incoming `BidRequest`
+- A positive `Bid.Price`
+- A `Bid.CrID` which uniquely identifies the Creative in the bid.
+
+Bids which don't satisfy these standards will be filtered out before Prebid Server responds.

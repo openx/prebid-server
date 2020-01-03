@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/adapters"
+	"github.com/prebid/prebid-server/errortypes"
+	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/pbs"
 	"golang.org/x/net/context/ctxhttp"
 )
@@ -39,8 +40,8 @@ type PulsepointParams struct {
 }
 
 func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidder *pbs.PBSBidder) (pbs.PBSBidSlice, error) {
-	mediaTypes := []pbs.MediaType{pbs.MEDIA_TYPE_BANNER, pbs.MEDIA_TYPE_VIDEO}
-	ppReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), mediaTypes, true)
+	mediaTypes := []pbs.MediaType{pbs.MEDIA_TYPE_BANNER}
+	ppReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), mediaTypes)
 
 	if err != nil {
 		return nil, err
@@ -50,16 +51,24 @@ func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 		var params PulsepointParams
 		err := json.Unmarshal(unit.Params, &params)
 		if err != nil {
-			return nil, err
+			return nil, &errortypes.BadInput{
+				Message: err.Error(),
+			}
 		}
 		if params.PublisherId == 0 {
-			return nil, fmt.Errorf("Missing PublisherId param cp")
+			return nil, &errortypes.BadInput{
+				Message: "Missing PublisherId param cp",
+			}
 		}
 		if params.TagId == 0 {
-			return nil, fmt.Errorf("Missing TagId param ct")
+			return nil, &errortypes.BadInput{
+				Message: "Missing TagId param ct",
+			}
 		}
 		if params.AdSize == "" {
-			return nil, fmt.Errorf("Missing AdSize param cf")
+			return nil, &errortypes.BadInput{
+				Message: "Missing AdSize param cf",
+			}
 		}
 		// Fixes some segfaults. Since this is legacy code, I'm not looking into it too deeply
 		if len(ppReq.Imp) <= i {
@@ -83,16 +92,22 @@ func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 				if err == nil {
 					ppReq.Imp[i].Banner.W = openrtb.Uint64Ptr(uint64(width))
 				} else {
-					return nil, fmt.Errorf("Invalid Width param %s", size[0])
+					return nil, &errortypes.BadInput{
+						Message: fmt.Sprintf("Invalid Width param %s", size[0]),
+					}
 				}
 				height, err := strconv.Atoi(size[1])
 				if err == nil {
 					ppReq.Imp[i].Banner.H = openrtb.Uint64Ptr(uint64(height))
 				} else {
-					return nil, fmt.Errorf("Invalid Height param %s", size[1])
+					return nil, &errortypes.BadInput{
+						Message: fmt.Sprintf("Invalid Height param %s", size[1]),
+					}
 				}
 			} else {
-				return nil, fmt.Errorf("Invalid AdSize param %s", params.AdSize)
+				return nil, &errortypes.BadInput{
+					Message: fmt.Sprintf("Invalid AdSize param %s", params.AdSize),
+				}
 			}
 		}
 	}
@@ -117,12 +132,20 @@ func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 
 	debug.StatusCode = ppResp.StatusCode
 
-	if ppResp.StatusCode == 204 {
+	if ppResp.StatusCode == http.StatusNoContent {
 		return nil, nil
 	}
 
-	if ppResp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP status: %d", ppResp.StatusCode)
+	if ppResp.StatusCode == http.StatusBadRequest {
+		return nil, &errortypes.BadInput{
+			Message: fmt.Sprintf("HTTP status: %d", ppResp.StatusCode),
+		}
+	}
+
+	if ppResp.StatusCode != http.StatusOK {
+		return nil, &errortypes.BadServerResponse{
+			Message: fmt.Sprintf("HTTP status: %d", ppResp.StatusCode),
+		}
 	}
 
 	defer ppResp.Body.Close()
@@ -138,7 +161,9 @@ func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 	var bidResp openrtb.BidResponse
 	err = json.Unmarshal(body, &bidResp)
 	if err != nil {
-		return nil, err
+		return nil, &errortypes.BadServerResponse{
+			Message: err.Error(),
+		}
 	}
 
 	bids := make(pbs.PBSBidSlice, 0)
@@ -147,18 +172,21 @@ func (a *PulsePointAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 		for _, bid := range sb.Bid {
 			bidID := bidder.LookupBidID(bid.ImpID)
 			if bidID == "" {
-				return nil, errors.New(fmt.Sprintf("Unknown ad unit code '%s'", bid.ImpID))
+				return nil, &errortypes.BadServerResponse{
+					Message: fmt.Sprintf("Unknown ad unit code '%s'", bid.ImpID),
+				}
 			}
 
 			pbid := pbs.PBSBid{
-				BidID:       bidID,
-				AdUnitCode:  bid.ImpID,
-				BidderCode:  bidder.BidderCode,
-				Price:       bid.Price,
-				Adm:         bid.AdM,
-				Creative_id: bid.CrID,
-				Width:       bid.W,
-				Height:      bid.H,
+				BidID:             bidID,
+				AdUnitCode:        bid.ImpID,
+				BidderCode:        bidder.BidderCode,
+				Price:             bid.Price,
+				Adm:               bid.AdM,
+				Creative_id:       bid.CrID,
+				Width:             bid.W,
+				Height:            bid.H,
+				CreativeMediaType: string(openrtb_ext.BidTypeBanner),
 			}
 			bids = append(bids, &pbid)
 		}

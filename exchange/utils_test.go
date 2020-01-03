@@ -1,13 +1,208 @@
 package exchange
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/pbsmetrics"
+	"github.com/stretchr/testify/assert"
 )
+
+// permissionsMock mocks the Permissions interface for tests
+//
+// It only allows appnexus for GDPR consent
+type permissionsMock struct{}
+
+func (p *permissionsMock) HostCookiesAllowed(ctx context.Context, consent string) (bool, error) {
+	return true, nil
+}
+
+func (p *permissionsMock) BidderSyncAllowed(ctx context.Context, bidder openrtb_ext.BidderName, consent string) (bool, error) {
+	return true, nil
+}
+
+func (p *permissionsMock) PersonalInfoAllowed(ctx context.Context, bidder openrtb_ext.BidderName, PublisherID string, consent string) (bool, error) {
+	if bidder == "appnexus" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func assertReq(t *testing.T, reqByBidders map[openrtb_ext.BidderName]*openrtb.BidRequest,
+	applyCOPPA bool, consentedVendors map[string]bool) {
+	// assert individual bidder requests
+	assert.NotEqual(t, reqByBidders, 0, "cleanOpenRTBRequest should split request into individual bidder requests")
+
+	// assert for PI data
+	// Both appnexus and brightroll should be allowed since brightroll
+	// is used as an alias for appnexus in the test request
+	for bidderName, bidder := range reqByBidders {
+		if !applyCOPPA && consentedVendors[bidderName.String()] {
+			assert.NotEqual(t, bidder.User.BuyerUID, "", "cleanOpenRTBRequest shouldn't clean PI data as per COPPA or for a consented vendor as per GDPR or per CCPA")
+			assert.NotEqual(t, bidder.Device.DIDMD5, "", "cleanOpenRTBRequest shouldn't clean PI data as per COPPA or for a consented vendor as per GDPR or per CCPA")
+		} else {
+			assert.Equal(t, bidder.User.BuyerUID, "", "cleanOpenRTBRequest should clean PI data as per COPPA or for a non-consented vendor as per GDPR or per CCPA", bidderName.String())
+			assert.Equal(t, bidder.Device.DIDMD5, "", "cleanOpenRTBRequest should clean PI data as per COPPA or for a non-consented vendor as per GDPR or per CCPA", bidderName.String())
+		}
+	}
+}
+
+func TestCleanOpenRTBRequests(t *testing.T) {
+	testCases := []struct {
+		req              *openrtb.BidRequest
+		bidReqAssertions func(t *testing.T, reqByBidders map[openrtb_ext.BidderName]*openrtb.BidRequest,
+			applyCOPPA bool, consentedVendors map[string]bool)
+		hasError         bool
+		applyCOPPA       bool
+		consentedVendors map[string]bool
+	}{
+		{req: newRaceCheckingRequest(t), bidReqAssertions: assertReq, hasError: false,
+			applyCOPPA: true, consentedVendors: map[string]bool{"appnexus": true}},
+		{req: newAdapterAliasBidRequest(t), bidReqAssertions: assertReq, hasError: false,
+			applyCOPPA: false, consentedVendors: map[string]bool{"appnexus": true, "brightroll": true}},
+	}
+
+	for _, test := range testCases {
+		reqByBidders, _, err := cleanOpenRTBRequests(context.Background(), test.req, &emptyUsersync{}, map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels{}, pbsmetrics.Labels{}, &permissionsMock{}, true, true)
+		if test.hasError {
+			assert.NotNil(t, err, "Error shouldn't be nil")
+		} else {
+			assert.Nil(t, err, "Err should be nil")
+			test.bidReqAssertions(t, reqByBidders, test.applyCOPPA, test.consentedVendors)
+		}
+	}
+}
+
+func TestCleanOpenRTBRequestsCCPA(t *testing.T) {
+	testCases := []struct {
+		description     string
+		enforceCCPA     bool
+		expectDataScrub bool
+	}{
+		{
+			description:     "Feature Flag Enabled",
+			enforceCCPA:     true,
+			expectDataScrub: true,
+		},
+		{
+			description:     "Feature Flag Disabled",
+			enforceCCPA:     false,
+			expectDataScrub: false,
+		},
+	}
+
+	for _, test := range testCases {
+		req := newCCPABidRequest(t)
+
+		results, _, errs := cleanOpenRTBRequests(context.Background(), req, &emptyUsersync{}, map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels{}, pbsmetrics.Labels{}, &permissionsMock{}, true, test.enforceCCPA)
+		result := results["appnexus"]
+
+		assert.Nil(t, errs)
+
+		if test.expectDataScrub {
+			assert.Equal(t, result.User.BuyerUID, "", test.description+":User.BuyerUID")
+			assert.Equal(t, result.Device.DIDMD5, "", test.description+":Device.DIDMD5")
+		} else {
+			assert.NotEqual(t, result.User.BuyerUID, "", test.description+":User.BuyerUID")
+			assert.NotEqual(t, result.Device.DIDMD5, "", test.description+":Device.DIDMD5")
+		}
+	}
+}
+
+// newAdapterAliasBidRequest builds a BidRequest with aliases
+func newAdapterAliasBidRequest(t *testing.T) *openrtb.BidRequest {
+	dnt := int8(1)
+	return &openrtb.BidRequest{
+		Site: &openrtb.Site{
+			Page:   "www.some.domain.com",
+			Domain: "domain.com",
+			Publisher: &openrtb.Publisher{
+				ID: "some-publisher-id",
+			},
+		},
+		Device: &openrtb.Device{
+			DIDMD5:   "some device ID hash",
+			UA:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36",
+			IFA:      "ifa",
+			IP:       "132.173.230.74",
+			DNT:      &dnt,
+			Language: "EN",
+		},
+		Source: &openrtb.Source{
+			TID: "61018dc9-fa61-4c41-b7dc-f90b9ae80e87",
+		},
+		User: &openrtb.User{
+			ID:       "our-id",
+			BuyerUID: "their-id",
+			Ext:      json.RawMessage(`{"consent":"BONciguONcjGKADACHENAOLS1rAHDAFAAEAASABQAMwAeACEAFw","digitrust":{"id":"digi-id","keyv":1,"pref":1}}`),
+		},
+		Regs: &openrtb.Regs{
+			Ext: json.RawMessage(`{"gdpr":1}`),
+		},
+		Imp: []openrtb.Imp{{
+			ID: "some-imp-id",
+			Banner: &openrtb.Banner{
+				Format: []openrtb.Format{{
+					W: 300,
+					H: 250,
+				}, {
+					W: 300,
+					H: 600,
+				}},
+			},
+			Ext: json.RawMessage(`{"appnexus": {"placementId": 10433394},"brightroll": {"placementId": 105}}`),
+		}},
+		Ext: json.RawMessage(`{"prebid":{"aliases":{"brightroll":"appnexus"}}}`),
+	}
+}
+
+func newCCPABidRequest(t *testing.T) *openrtb.BidRequest {
+	dnt := int8(1)
+	return &openrtb.BidRequest{
+		Site: &openrtb.Site{
+			Page:   "www.some.domain.com",
+			Domain: "domain.com",
+			Publisher: &openrtb.Publisher{
+				ID: "some-publisher-id",
+			},
+		},
+		Device: &openrtb.Device{
+			DIDMD5:   "some device ID hash",
+			UA:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36",
+			IFA:      "ifa",
+			IP:       "132.173.230.74",
+			DNT:      &dnt,
+			Language: "EN",
+		},
+		Source: &openrtb.Source{
+			TID: "61018dc9-fa61-4c41-b7dc-f90b9ae80e87",
+		},
+		User: &openrtb.User{
+			ID:       "our-id",
+			BuyerUID: "their-id",
+			Ext:      json.RawMessage(`{"digitrust":{"id":"digi-id","keyv":1,"pref":1}}`),
+		},
+		Regs: &openrtb.Regs{
+			Ext: json.RawMessage(`{"us_privacy":"1-Y-"}`),
+		},
+		Imp: []openrtb.Imp{{
+			ID: "some-imp-id",
+			Banner: &openrtb.Banner{
+				Format: []openrtb.Format{{
+					W: 300,
+					H: 250,
+				}, {
+					W: 300,
+					H: 600,
+				}},
+			},
+			Ext: json.RawMessage(`{"appnexus": {"placementId": 10433394}}`),
+		}},
+	}
+}
 
 func TestRandomizeList(t *testing.T) {
 	adapters := make([]openrtb_ext.BidderName, 3)
@@ -18,154 +213,14 @@ func TestRandomizeList(t *testing.T) {
 	randomizeList(adapters)
 
 	if len(adapters) != 3 {
-		t.Errorf("RondomizeList, expected a list of 3, found %d", len(adapters))
+		t.Errorf("RandomizeList, expected a list of 3, found %d", len(adapters))
 	}
 
 	adapters = adapters[0:1]
 	randomizeList(adapters)
 
 	if len(adapters) != 1 {
-		t.Errorf("RondomizeList, expected a list of 1, found %d", len(adapters))
+		t.Errorf("RandomizeList, expected a list of 1, found %d", len(adapters))
 	}
 
-}
-
-func TestCleanOpenRTBRequests(t *testing.T) {
-	// Very simple Bid request. The dummy bidders know what to do.
-	bidRequest := openrtb.BidRequest{
-		ID:  "This Bid",
-		Imp: make([]openrtb.Imp, 2),
-		Ext: openrtb.RawJSON(`{"prebid":{"aliases":{"dummy":"appnexus","dummy2":"rubicon","dummy3":"indexExchange"}}}`),
-	}
-	// Need extensions for all the bidders so we know to hold auctions for them.
-	impExt := make(map[string]interface{})
-	dummy1Ext := make(map[string]string)
-	dummy2Ext := make(map[string]string)
-	dummy3Ext := make(map[string]string)
-	dummy1Ext["placementId"] = "5554444"
-	dummy2Ext["accountID"] = "abc"
-	dummy3Ext["placementId"] = "1234567"
-	impExt["dummy"] = dummy1Ext
-	impExt["dummy2"] = dummy2Ext
-	impExt["dummy3"] = dummy3Ext
-
-	b, err := json.Marshal(impExt)
-	if err != nil {
-		t.Errorf("Error Mashalling bidRequest Extants: %s", err.Error())
-	}
-	bidRequest.Imp[0].Ext = b
-	bidRequest.Imp[1].Ext = b
-	cleanRequests, _, errList := cleanOpenRTBRequests(&bidRequest, &emptyUsersync{}, make(map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels), pbsmetrics.Labels{})
-
-	if len(errList) > 0 {
-		for _, e := range errList {
-			t.Errorf("CleanOpenRTBRequests: %s", e.Error())
-		}
-	}
-	if len(cleanRequests) != 3 {
-		t.Fatalf("CleanOpenRTBRequests: expected 3 requests, found %d", len(cleanRequests))
-	}
-
-	var cleanImpExt map[string]map[string]string
-	err = json.Unmarshal(cleanRequests[openrtb_ext.BidderName("dummy")].Imp[0].Ext, &cleanImpExt)
-	if err != nil {
-		t.Errorf("CleanOpenRTBRequests: %s", err.Error())
-	}
-	dummymap, ok := cleanImpExt["bidder"]
-	if !ok {
-		t.Error("CleanOpenRTBRequests: dummy adapter did not get proper bidder extension")
-	}
-	if dummymap["placementId"] != "5554444" {
-		t.Errorf("CleanOpenRTBRequests: dummy adapter did not get proper placementId, got \"%s\" instead", cleanImpExt["dummy"]["placementId"])
-	}
-	_, ok = dummymap["accountID"]
-	if ok {
-		t.Error("CleanOpenRTBRequests: dummy adapter got dummy2 parameter")
-	}
-	err = json.Unmarshal(cleanRequests[openrtb_ext.BidderName("dummy3")].Imp[0].Ext, &cleanImpExt)
-	if err != nil {
-		t.Errorf("CleanOpenRTBRequests: %s", err.Error())
-	}
-	dummymap, ok = cleanImpExt["bidder"]
-	if !ok {
-		t.Error("CleanOpenRTBRequests: dummy3 adapter did not get proper bidder extension")
-	}
-	if dummymap["placementId"] != "1234567" {
-		t.Errorf("CleanOpenRTBRequests: dummy3 adapter did not get proper placementId, got \"%s\" instead", cleanImpExt["dummy"]["placementId"])
-	}
-}
-
-func TestBuyerUIDs(t *testing.T) {
-	bidRequest := openrtb.BidRequest{
-		ID: "This Bid",
-		Imp: []openrtb.Imp{{
-			Ext: openrtb.RawJSON(`{"dummy":{},"appnexus":{},"rubicon":{}}`),
-		}},
-		User: &openrtb.User{
-			Ext: openrtb.RawJSON(`{"prebid":{"buyeruids":{"dummy":"explicitDummyID","rubicon":"explicitRubiID"}}}`),
-		},
-		Ext: openrtb.RawJSON(`{"prebid":{"aliases":{"dummy":"appnexus"}}}`),
-	}
-	syncs := &mockUsersync{
-		syncs: map[string]string{
-			"appnexus": "apnCookie",
-		},
-	}
-	cleanRequests, _, errList := cleanOpenRTBRequests(&bidRequest, syncs, make(map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels), pbsmetrics.Labels{})
-	if len(errList) > 0 {
-		t.Fatalf("Unexpected errors: %v", errList)
-	}
-	if len(cleanRequests) != 3 {
-		t.Errorf("Unexpected number of requets: %v", cleanRequests)
-	}
-	if cleanRequests[openrtb_ext.BidderAppnexus].User.BuyerUID != "apnCookie" {
-		t.Errorf("request.user.buyeruid to appnexus should be apnCookie. Got %s", cleanRequests[openrtb_ext.BidderAppnexus].User.BuyerUID)
-	}
-	if cleanRequests[openrtb_ext.BidderRubicon].User.BuyerUID != "explicitRubiID" {
-		t.Errorf("request.user.buyeruid to appnexus should be explicitRubiID. Got %s", cleanRequests[openrtb_ext.BidderRubicon].User.BuyerUID)
-	}
-	if cleanRequests[openrtb_ext.BidderName("dummy")].User.BuyerUID != "explicitDummyID" {
-		t.Errorf("request.user.buyeruid to dummy should be explicitDummyID. Got %s", cleanRequests[openrtb_ext.BidderAppnexus].User.BuyerUID)
-	}
-}
-
-func TestUserExplicitUID(t *testing.T) {
-	bidRequest := openrtb.BidRequest{
-		ID: "This Bid",
-		Imp: []openrtb.Imp{{
-			Ext: openrtb.RawJSON(`{"dummy":{},"appnexus":{},"rubicon":{}}`),
-		}},
-		User: &openrtb.User{
-			BuyerUID: "apnExplicit",
-			Ext:      openrtb.RawJSON(`{"digitrust":{"id":"abc","keyv":1,"pref":2}}`),
-		},
-		Ext: openrtb.RawJSON(`{"prebid":{"aliases":{"dummy":"appnexus"}}}`),
-	}
-	syncs := &mockUsersync{
-		syncs: map[string]string{
-			"appnexus": "apnCookie",
-		},
-	}
-	cleanRequests, _, errList := cleanOpenRTBRequests(&bidRequest, syncs, make(map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels), pbsmetrics.Labels{})
-	if len(errList) > 0 {
-		t.Fatalf("Got unexpected errors: %v", errList)
-	}
-	if cleanRequests[openrtb_ext.BidderAppnexus].User.BuyerUID != "apnExplicit" {
-		t.Errorf("Appnexus should get the explicit buyeruid. Instead got %s", cleanRequests[openrtb_ext.BidderAppnexus].User.BuyerUID)
-	}
-}
-
-type emptyUsersync struct{}
-
-func (e *emptyUsersync) GetId(bidder openrtb_ext.BidderName) (string, bool) {
-	return "", false
-}
-
-type mockUsersync struct {
-	syncs map[string]string
-}
-
-func (e *mockUsersync) GetId(bidder openrtb_ext.BidderName) (id string, exists bool) {
-	id, exists = e.syncs[string(bidder)]
-	return
 }

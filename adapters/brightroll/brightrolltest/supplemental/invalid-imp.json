@@ -1,0 +1,16 @@
+{
+  "mockBidRequest": {
+    "id": "test-request-id",
+    "ext": {
+      "bidder": {
+        "publisher": "cafemom"
+      }
+    }
+  },
+  "expectedMakeRequestsErrors": [
+    {
+      "value": "No impression in the bid request",
+      "comparison": "literal"
+    }
+  ]
+}

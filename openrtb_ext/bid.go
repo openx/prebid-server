@@ -1,15 +1,14 @@
 package openrtb_ext
 
 import (
+	"encoding/json"
 	"fmt"
-
-	"github.com/mxmCherry/openrtb"
 )
 
 // ExtBid defines the contract for bidresponse.seatbid.bid[i].ext
 type ExtBid struct {
 	Prebid *ExtBidPrebid   `json:"prebid,omitempty"`
-	Bidder openrtb.RawJSON `json:"bidder,omitempty"`
+	Bidder json.RawMessage `json:"bidder,omitempty"`
 }
 
 // ExtBidPrebid defines the contract for bidresponse.seatbid.bid[i].ext.prebid
@@ -17,12 +16,25 @@ type ExtBidPrebid struct {
 	Cache     *ExtBidPrebidCache `json:"cache,omitempty"`
 	Targeting map[string]string  `json:"targeting,omitempty"`
 	Type      BidType            `json:"type"`
+	Video     *ExtBidPrebidVideo `json:"video,omitempty"`
 }
 
 // ExtBidPrebidCache defines the contract for  bidresponse.seatbid.bid[i].ext.prebid.cache
 type ExtBidPrebidCache struct {
-	Key string `json:"key"`
-	Url string `json:"url"`
+	Key  string                 `json:"key"`
+	Url  string                 `json:"url"`
+	Bids *ExtBidPrebidCacheBids `json:"bids,omitempty"`
+}
+
+type ExtBidPrebidCacheBids struct {
+	Url     string `json:"url"`
+	CacheId string `json:"cacheId"`
+}
+
+// ExtBidPrebidVideo defines the contract for bidresponse.seatbid.bid[i].ext.prebid.video
+type ExtBidPrebidVideo struct {
+	Duration        int    `json:"duration"`
+	PrimaryCategory string `json:"primary_category"`
 }
 
 // BidType describes the allowed values for bidresponse.seatbid.bid[i].ext.prebid.type
@@ -34,6 +46,15 @@ const (
 	BidTypeAudio          = "audio"
 	BidTypeNative         = "native"
 )
+
+func BidTypes() []BidType {
+	return []BidType{
+		BidTypeBanner,
+		BidTypeVideo,
+		BidTypeAudio,
+		BidTypeNative,
+	}
+}
 
 func ParseBidType(bidType string) (BidType, error) {
 	switch bidType {
@@ -69,25 +90,27 @@ const (
 	// It will exist only if the incoming bidRequest defiend request.app instead of request.site.
 	HbEnvKey TargetingKey = "hb_env"
 
+	// HbCacheHost and HbCachePath exist to supply cache host and path as targeting parameters
+	HbConstantCacheHostKey TargetingKey = "hb_cache_host"
+	HbConstantCachePathKey TargetingKey = "hb_cache_path"
+
 	// HbBidderConstantKey is the name of the Bidder. For example, "appnexus" or "rubicon".
 	HbBidderConstantKey TargetingKey = "hb_bidder"
 	HbSizeConstantKey   TargetingKey = "hb_size"
+	HbDealIDConstantKey TargetingKey = "hb_deal"
 
-	// HbCreativeLoadMethodConstantKey is used exclusively by Prebid Mobile to accomodate Facebook.
-	// Facebook requires that ads from their network be loaded using their own SDK.
-	// Other demand sources are happy to let Prebid Mobile use a Webview.
-	HbCreativeLoadMethodConstantKey TargetingKey = "hb_creative_loadtype"
-	HbDealIdConstantKey             TargetingKey = "hb_deal"
-	// HbCacheKey stores the UUID which can be used to fetch the bid data from prebid cache.
-	// Callers should *never* assume that this exists, since the call to the cache may always fail.
-	HbCacheKey TargetingKey = "hb_cache_id"
-
-	// These are not keys, but values used by hbCreativeLoadMethodConstantKey
-	HbCreativeLoadMethodHTML      string = "html"
-	HbCreativeLoadMethodDemandSDK string = "demand_sdk"
+	// HbCacheKey and HbVastCacheKey store UUIDs which can be used to fetch things from prebid cache.
+	// Callers should *never* assume that either of these exist, since the call to the cache may always fail.
+	//
+	// HbVastCacheKey's UUID will fetch the entire bid JSON, while HbVastCacheKey will fetch just the VAST XML.
+	// HbVastCacheKey will only ever exist for Video bids.
+	HbCacheKey     TargetingKey = "hb_cache_id"
+	HbVastCacheKey TargetingKey = "hb_uuid"
 
 	// This is not a key, but values used by the HbEnvKey
 	HbEnvKeyApp string = "mobile-app"
+
+	HbCategoryDurationKey TargetingKey = "hb_pb_cat_dur"
 )
 
 func (key TargetingKey) BidderKey(bidder BidderName, maxLength int) string {

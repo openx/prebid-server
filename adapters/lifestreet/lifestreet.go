@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"github.com/prebid/prebid-server/openrtb_ext"
 	"io/ioutil"
 	"net/http"
 	"strings"
 
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/adapters"
+	"github.com/prebid/prebid-server/errortypes"
 	"github.com/prebid/prebid-server/pbs"
 	"golang.org/x/net/context/ctxhttp"
 )
@@ -71,21 +72,33 @@ func (a *LifestreetAdapter) callOne(ctx context.Context, req *pbs.PBSRequest, re
 	}
 	bid := bidResp.SeatBid[0].Bid[0]
 
+	t := openrtb_ext.BidTypeBanner
+
+	if bid.Ext != nil {
+		var e openrtb_ext.ExtBid
+		err = json.Unmarshal(bid.Ext, &e)
+		if err != nil {
+			return
+		}
+		t = e.Prebid.Type
+	}
+
 	result.Bid = &pbs.PBSBid{
-		AdUnitCode:  bid.ImpID,
-		Price:       bid.Price,
-		Adm:         bid.AdM,
-		Creative_id: bid.CrID,
-		Width:       bid.W,
-		Height:      bid.H,
-		DealId:      bid.DealID,
-		NURL:        bid.NURL,
+		AdUnitCode:        bid.ImpID,
+		Price:             bid.Price,
+		Adm:               bid.AdM,
+		Creative_id:       bid.CrID,
+		Width:             bid.W,
+		Height:            bid.H,
+		DealId:            bid.DealID,
+		NURL:              bid.NURL,
+		CreativeMediaType: string(t),
 	}
 	return
 }
 
 func (a *LifestreetAdapter) MakeOpenRtbBidRequest(req *pbs.PBSRequest, bidder *pbs.PBSBidder, slotTag string, mtype pbs.MediaType, unitInd int) (openrtb.BidRequest, error) {
-	lsReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), []pbs.MediaType{mtype}, true)
+	lsReq, err := adapters.MakeOpenRTBGeneric(req, bidder, a.Name(), []pbs.MediaType{mtype})
 
 	if err != nil {
 		return openrtb.BidRequest{}, err
@@ -101,7 +114,9 @@ func (a *LifestreetAdapter) MakeOpenRtbBidRequest(req *pbs.PBSRequest, bidder *p
 
 		return lsReq, nil
 	} else {
-		return lsReq, errors.New("No supported impressions")
+		return lsReq, &errortypes.BadInput{
+			Message: "No supported impressions",
+		}
 	}
 }
 
@@ -115,11 +130,15 @@ func (a *LifestreetAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 			return nil, err
 		}
 		if params.SlotTag == "" {
-			return nil, errors.New("Missing slot_tag param")
+			return nil, &errortypes.BadInput{
+				Message: "Missing slot_tag param",
+			}
 		}
 		s := strings.Split(params.SlotTag, ".")
 		if len(s) != 2 {
-			return nil, fmt.Errorf("Invalid slot_tag param '%s'", params.SlotTag)
+			return nil, &errortypes.BadInput{
+				Message: fmt.Sprintf("Invalid slot_tag param '%s'", params.SlotTag),
+			}
 		}
 
 		// BANNER
@@ -144,7 +163,7 @@ func (a *LifestreetAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 	}
 
 	ch := make(chan adapters.CallOneResult)
-	for i, _ := range bidder.AdUnits {
+	for i := range bidder.AdUnits {
 		go func(bidder *pbs.PBSBidder, reqJSON bytes.Buffer) {
 			result, err := a.callOne(ctx, req, reqJSON)
 			result.Error = err
@@ -152,7 +171,9 @@ func (a *LifestreetAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 				result.Bid.BidderCode = bidder.BidderCode
 				result.Bid.BidID = bidder.LookupBidID(result.Bid.AdUnitCode)
 				if result.Bid.BidID == "" {
-					result.Error = fmt.Errorf("Unknown ad unit code '%s'", result.Bid.AdUnitCode)
+					result.Error = &errortypes.BadServerResponse{
+						Message: fmt.Sprintf("Unknown ad unit code '%s'", result.Bid.AdUnitCode),
+					}
 					result.Bid = nil
 				}
 			}
@@ -188,10 +209,10 @@ func (a *LifestreetAdapter) Call(ctx context.Context, req *pbs.PBSRequest, bidde
 	return bids, nil
 }
 
-func NewLifestreetAdapter(config *adapters.HTTPAdapterConfig) *LifestreetAdapter {
+func NewLifestreetAdapter(config *adapters.HTTPAdapterConfig, endpoint string) *LifestreetAdapter {
 	a := adapters.NewHTTPAdapter(config)
 	return &LifestreetAdapter{
 		http: a,
-		URI:  "https://prebid.s2s.lfstmedia.com/adrequest",
+		URI:  endpoint,
 	}
 }

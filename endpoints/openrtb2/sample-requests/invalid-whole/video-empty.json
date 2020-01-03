@@ -1,9 +1,15 @@
 {
+  "message": "Invalid request: request.imp[0].video.mimes must contain at least one supported MIME type\n",
+  "requestPayload": {
     "id": "req-id",
     "imp": [
-        {
-            "id": "imp-id",
-            "video": {}
-        }
-    ]
+      {
+        "id": "imp-id",
+        "video": {}
+      }
+    ],
+    "app": {
+      "id": "app_001"
+    }
+  }
 }

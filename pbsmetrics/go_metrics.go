@@ -6,29 +6,46 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/openrtb_ext"
-	"github.com/rcrowley/go-metrics"
+	metrics "github.com/rcrowley/go-metrics"
 )
 
 // Metrics is the legacy Metrics object (go-metrics) expanded to also satisfy the MetricsEngine interface
 type Metrics struct {
-	metricsRegistry     metrics.Registry
-	RequestMeter        metrics.Meter
-	AppRequestMeter     metrics.Meter
-	NoCookieMeter       metrics.Meter
-	SafariRequestMeter  metrics.Meter
-	SafariNoCookieMeter metrics.Meter
-	ErrorMeter          metrics.Meter
-	RequestTimer        metrics.Timer
+	MetricsRegistry                metrics.Registry
+	ConnectionCounter              metrics.Counter
+	ConnectionAcceptErrorMeter     metrics.Meter
+	ConnectionCloseErrorMeter      metrics.Meter
+	ImpMeter                       metrics.Meter
+	LegacyImpMeter                 metrics.Meter
+	AppRequestMeter                metrics.Meter
+	NoCookieMeter                  metrics.Meter
+	SafariRequestMeter             metrics.Meter
+	SafariNoCookieMeter            metrics.Meter
+	RequestTimer                   metrics.Timer
+	PrebidCacheRequestTimerSuccess metrics.Timer
+	PrebidCacheRequestTimerError   metrics.Timer
+	StoredReqCacheMeter            map[CacheResult]metrics.Meter
+	StoredImpCacheMeter            map[CacheResult]metrics.Meter
+
 	// Metrics for OpenRTB requests specifically. So we can track what % of RequestsMeter are OpenRTB
 	// and know when legacy requests have been abandoned.
-	ORTBRequestMeter   metrics.Meter
-	AmpRequestMeter    metrics.Meter
-	AmpNoCookieMeter   metrics.Meter
-	CookieSyncMeter    metrics.Meter
-	userSyncOptout     metrics.Meter
-	userSyncBadRequest metrics.Meter
-	userSyncSet        map[openrtb_ext.BidderName]metrics.Meter
+	RequestStatuses       map[RequestType]map[RequestStatus]metrics.Meter
+	AmpNoCookieMeter      metrics.Meter
+	CookieSyncMeter       metrics.Meter
+	CookieSyncGen         map[openrtb_ext.BidderName]metrics.Meter
+	CookieSyncGDPRPrevent map[openrtb_ext.BidderName]metrics.Meter
+	userSyncOptout        metrics.Meter
+	userSyncBadRequest    metrics.Meter
+	userSyncSet           map[openrtb_ext.BidderName]metrics.Meter
+	userSyncGDPRPrevent   map[openrtb_ext.BidderName]metrics.Meter
+
+	// Media types found in the "imp" JSON object
+	ImpsTypeBanner metrics.Meter
+	ImpsTypeVideo  metrics.Meter
+	ImpsTypeAudio  metrics.Meter
+	ImpsTypeNative metrics.Meter
 
 	AdapterMetrics map[openrtb_ext.BidderName]*AdapterMetrics
 	// Don't export accountMetrics because we need helper functions here to insure its properly populated dynamically
@@ -37,18 +54,26 @@ type Metrics struct {
 	userSyncRwMutex       sync.RWMutex
 
 	exchanges []openrtb_ext.BidderName
+	// Will hold boolean values to help us disable metric collection if needed
+	MetricsDisabled config.DisabledMetrics
 }
 
 // AdapterMetrics houses the metrics for a particular adapter
 type AdapterMetrics struct {
 	NoCookieMeter     metrics.Meter
-	ErrorMeter        metrics.Meter
+	ErrorMeters       map[AdapterError]metrics.Meter
 	NoBidMeter        metrics.Meter
-	TimeoutMeter      metrics.Meter
-	RequestMeter      metrics.Meter
+	GotBidsMeter      metrics.Meter
 	RequestTimer      metrics.Timer
 	PriceHistogram    metrics.Histogram
 	BidsReceivedMeter metrics.Meter
+	PanicMeter        metrics.Meter
+	MarkupMetrics     map[openrtb_ext.BidType]*MarkupDeliveryMetrics
+}
+
+type MarkupDeliveryMetrics struct {
+	AdmMeter  metrics.Meter
+	NurlMeter metrics.Meter
 }
 
 type accountMetrics struct {
@@ -64,31 +89,61 @@ const unknownBidder openrtb_ext.BidderName = "unknown"
 
 // NewBlankMetrics creates a new Metrics object with all blank metrics object. This may also be useful for
 // testing routines to ensure that no metrics are written anywhere.
-func NewBlankMetrics(registry metrics.Registry, exchanges []openrtb_ext.BidderName) *Metrics {
-	newMetrics := &Metrics{
-		metricsRegistry:     registry,
-		RequestMeter:        blankMeter(0),
-		AppRequestMeter:     blankMeter(0),
-		NoCookieMeter:       blankMeter(0),
-		SafariRequestMeter:  blankMeter(0),
-		SafariNoCookieMeter: blankMeter(0),
-		ErrorMeter:          blankMeter(0),
-		RequestTimer:        blankTimer(0),
-		ORTBRequestMeter:    blankMeter(0),
-		AmpRequestMeter:     blankMeter(0),
-		AmpNoCookieMeter:    blankMeter(0),
-		CookieSyncMeter:     blankMeter(0),
-		userSyncOptout:      blankMeter(0),
-		userSyncBadRequest:  blankMeter(0),
-		userSyncSet:         make(map[openrtb_ext.BidderName]metrics.Meter),
+//
+// This will be useful when removing endpoints, we can just run will the blank metrics function
+// rather than loading legacy metrics that never get filled.
+// This will also eventually let us configure metrics, such as setting a limited set of metrics
+// for a production instance, and then expanding again when we need more debugging.
+func NewBlankMetrics(registry metrics.Registry, exchanges []openrtb_ext.BidderName, disableMetrics config.DisabledMetrics) *Metrics {
+	blankMeter := &metrics.NilMeter{}
+	blankTimer := &metrics.NilTimer{}
 
-		AdapterMetrics: make(map[openrtb_ext.BidderName]*AdapterMetrics, len(exchanges)),
-		accountMetrics: make(map[string]*accountMetrics),
+	newMetrics := &Metrics{
+		MetricsRegistry:                registry,
+		RequestStatuses:                make(map[RequestType]map[RequestStatus]metrics.Meter),
+		ConnectionCounter:              metrics.NilCounter{},
+		ConnectionAcceptErrorMeter:     blankMeter,
+		ConnectionCloseErrorMeter:      blankMeter,
+		ImpMeter:                       blankMeter,
+		LegacyImpMeter:                 blankMeter,
+		AppRequestMeter:                blankMeter,
+		NoCookieMeter:                  blankMeter,
+		SafariRequestMeter:             blankMeter,
+		SafariNoCookieMeter:            blankMeter,
+		RequestTimer:                   blankTimer,
+		PrebidCacheRequestTimerSuccess: blankTimer,
+		PrebidCacheRequestTimerError:   blankTimer,
+		StoredReqCacheMeter:            make(map[CacheResult]metrics.Meter),
+		StoredImpCacheMeter:            make(map[CacheResult]metrics.Meter),
+		AmpNoCookieMeter:               blankMeter,
+		CookieSyncMeter:                blankMeter,
+		CookieSyncGen:                  make(map[openrtb_ext.BidderName]metrics.Meter),
+		CookieSyncGDPRPrevent:          make(map[openrtb_ext.BidderName]metrics.Meter),
+		userSyncOptout:                 blankMeter,
+		userSyncBadRequest:             blankMeter,
+		userSyncSet:                    make(map[openrtb_ext.BidderName]metrics.Meter),
+		userSyncGDPRPrevent:            make(map[openrtb_ext.BidderName]metrics.Meter),
+
+		ImpsTypeBanner: blankMeter,
+		ImpsTypeVideo:  blankMeter,
+		ImpsTypeAudio:  blankMeter,
+		ImpsTypeNative: blankMeter,
+
+		AdapterMetrics:  make(map[openrtb_ext.BidderName]*AdapterMetrics, len(exchanges)),
+		accountMetrics:  make(map[string]*accountMetrics),
+		MetricsDisabled: disableMetrics,
 
 		exchanges: exchanges,
 	}
 	for _, a := range exchanges {
-		newMetrics.AdapterMetrics[a] = makeBlankAdapterMetrics(registry, a)
+		newMetrics.AdapterMetrics[a] = makeBlankAdapterMetrics()
+	}
+
+	for _, t := range RequestTypes() {
+		newMetrics.RequestStatuses[t] = make(map[RequestStatus]metrics.Meter)
+		for _, s := range RequestStatuses() {
+			newMetrics.RequestStatuses[t][s] = blankMeter
+		}
 	}
 
 	return newMetrics
@@ -99,56 +154,115 @@ func NewBlankMetrics(registry metrics.Registry, exchanges []openrtb_ext.BidderNa
 // metrics object to contain only the metrics we are interested in. This would allow for debug
 // mode metrics. The code would allways try to record the metrics, but effectively noop if we are
 // using a blank meter/timer.
-func NewMetrics(registry metrics.Registry, exchanges []openrtb_ext.BidderName) *Metrics {
-	newMetrics := NewBlankMetrics(registry, exchanges)
-	newMetrics.RequestMeter = metrics.GetOrRegisterMeter("requests", registry)
+func NewMetrics(registry metrics.Registry, exchanges []openrtb_ext.BidderName, disableAccountMetrics config.DisabledMetrics) *Metrics {
+	newMetrics := NewBlankMetrics(registry, exchanges, disableAccountMetrics)
+	newMetrics.ConnectionCounter = metrics.GetOrRegisterCounter("active_connections", registry)
+	newMetrics.ConnectionAcceptErrorMeter = metrics.GetOrRegisterMeter("connection_accept_errors", registry)
+	newMetrics.ConnectionCloseErrorMeter = metrics.GetOrRegisterMeter("connection_close_errors", registry)
+	newMetrics.ImpMeter = metrics.GetOrRegisterMeter("imps_requested", registry)
+	newMetrics.LegacyImpMeter = metrics.GetOrRegisterMeter("legacy_imps_requested", registry)
+
+	newMetrics.ImpsTypeBanner = metrics.GetOrRegisterMeter("imp_banner", registry)
+	newMetrics.ImpsTypeVideo = metrics.GetOrRegisterMeter("imp_video", registry)
+	newMetrics.ImpsTypeAudio = metrics.GetOrRegisterMeter("imp_audio", registry)
+	newMetrics.ImpsTypeNative = metrics.GetOrRegisterMeter("imp_native", registry)
+
 	newMetrics.SafariRequestMeter = metrics.GetOrRegisterMeter("safari_requests", registry)
-	newMetrics.ErrorMeter = metrics.GetOrRegisterMeter("error_requests", registry)
 	newMetrics.NoCookieMeter = metrics.GetOrRegisterMeter("no_cookie_requests", registry)
 	newMetrics.AppRequestMeter = metrics.GetOrRegisterMeter("app_requests", registry)
 	newMetrics.SafariNoCookieMeter = metrics.GetOrRegisterMeter("safari_no_cookie_requests", registry)
 	newMetrics.RequestTimer = metrics.GetOrRegisterTimer("request_time", registry)
-	newMetrics.ORTBRequestMeter = metrics.GetOrRegisterMeter("ortb_requests", registry)
-	newMetrics.AmpRequestMeter = metrics.GetOrRegisterMeter("amp_requests", registry)
+	newMetrics.PrebidCacheRequestTimerSuccess = metrics.GetOrRegisterTimer("prebid_cache_request_time.ok", registry)
+	newMetrics.PrebidCacheRequestTimerError = metrics.GetOrRegisterTimer("prebid_cache_request_time.err", registry)
+
 	newMetrics.AmpNoCookieMeter = metrics.GetOrRegisterMeter("amp_no_cookie_requests", registry)
 	newMetrics.CookieSyncMeter = metrics.GetOrRegisterMeter("cookie_sync_requests", registry)
 	newMetrics.userSyncBadRequest = metrics.GetOrRegisterMeter("usersync.bad_requests", registry)
 	newMetrics.userSyncOptout = metrics.GetOrRegisterMeter("usersync.opt_outs", registry)
 	for _, a := range exchanges {
+		newMetrics.CookieSyncGen[a] = metrics.GetOrRegisterMeter(fmt.Sprintf("cookie_sync.%s.gen", string(a)), registry)
+		newMetrics.CookieSyncGDPRPrevent[a] = metrics.GetOrRegisterMeter(fmt.Sprintf("cookie_sync.%s.gdpr_prevent", string(a)), registry)
 		newMetrics.userSyncSet[a] = metrics.GetOrRegisterMeter(fmt.Sprintf("usersync.%s.sets", string(a)), registry)
+		newMetrics.userSyncGDPRPrevent[a] = metrics.GetOrRegisterMeter(fmt.Sprintf("usersync.%s.gdpr_prevent", string(a)), registry)
 		registerAdapterMetrics(registry, "adapter", string(a), newMetrics.AdapterMetrics[a])
 	}
+	for typ, statusMap := range newMetrics.RequestStatuses {
+		for stat := range statusMap {
+			statusMap[stat] = metrics.GetOrRegisterMeter("requests."+string(stat)+"."+string(typ), registry)
+		}
+	}
+	for _, cacheRes := range CacheResults() {
+		newMetrics.StoredReqCacheMeter[cacheRes] = metrics.GetOrRegisterMeter(fmt.Sprintf("stored_request_cache_%s", string(cacheRes)), registry)
+		newMetrics.StoredImpCacheMeter[cacheRes] = metrics.GetOrRegisterMeter(fmt.Sprintf("stored_imp_cache_%s", string(cacheRes)), registry)
+	}
+
 	newMetrics.userSyncSet[unknownBidder] = metrics.GetOrRegisterMeter("usersync.unknown.sets", registry)
+	newMetrics.userSyncGDPRPrevent[unknownBidder] = metrics.GetOrRegisterMeter("usersync.unknown.gdpr_prevent", registry)
 	return newMetrics
 }
 
 // Part of setting up blank metrics, the adapter metrics.
-func makeBlankAdapterMetrics(registry metrics.Registry, exchanges openrtb_ext.BidderName) *AdapterMetrics {
+func makeBlankAdapterMetrics() *AdapterMetrics {
+	blankMeter := &metrics.NilMeter{}
 	newAdapter := &AdapterMetrics{
-		NoCookieMeter:     blankMeter(0),
-		ErrorMeter:        blankMeter(0),
-		NoBidMeter:        blankMeter(0),
-		TimeoutMeter:      blankMeter(0),
-		RequestMeter:      blankMeter(0),
-		RequestTimer:      blankTimer(0),
-		PriceHistogram:    blankHistogram(0),
-		BidsReceivedMeter: blankMeter(0),
+		NoCookieMeter:     blankMeter,
+		ErrorMeters:       make(map[AdapterError]metrics.Meter),
+		NoBidMeter:        blankMeter,
+		GotBidsMeter:      blankMeter,
+		RequestTimer:      &metrics.NilTimer{},
+		PriceHistogram:    &metrics.NilHistogram{},
+		BidsReceivedMeter: blankMeter,
+		PanicMeter:        blankMeter,
+		MarkupMetrics:     makeBlankBidMarkupMetrics(),
+	}
+	for _, err := range AdapterErrors() {
+		newAdapter.ErrorMeters[err] = blankMeter
 	}
 	return newAdapter
 }
 
+func makeBlankBidMarkupMetrics() map[openrtb_ext.BidType]*MarkupDeliveryMetrics {
+	return map[openrtb_ext.BidType]*MarkupDeliveryMetrics{
+		openrtb_ext.BidTypeAudio:  makeBlankMarkupDeliveryMetrics(),
+		openrtb_ext.BidTypeBanner: makeBlankMarkupDeliveryMetrics(),
+		openrtb_ext.BidTypeNative: makeBlankMarkupDeliveryMetrics(),
+		openrtb_ext.BidTypeVideo:  makeBlankMarkupDeliveryMetrics(),
+	}
+}
+
+func makeBlankMarkupDeliveryMetrics() *MarkupDeliveryMetrics {
+	return &MarkupDeliveryMetrics{
+		AdmMeter:  &metrics.NilMeter{},
+		NurlMeter: &metrics.NilMeter{},
+	}
+}
+
 func registerAdapterMetrics(registry metrics.Registry, adapterOrAccount string, exchange string, am *AdapterMetrics) {
 	am.NoCookieMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.no_cookie_requests", adapterOrAccount, exchange), registry)
-	am.ErrorMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.error_requests", adapterOrAccount, exchange), registry)
-	am.NoBidMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.no_bid_requests", adapterOrAccount, exchange), registry)
-	am.TimeoutMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.timeout_requests", adapterOrAccount, exchange), registry)
-	am.RequestMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.requests", adapterOrAccount, exchange), registry)
+	am.NoBidMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.requests.nobid", adapterOrAccount, exchange), registry)
+	am.GotBidsMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.requests.gotbids", adapterOrAccount, exchange), registry)
 	am.RequestTimer = metrics.GetOrRegisterTimer(fmt.Sprintf("%[1]s.%[2]s.request_time", adapterOrAccount, exchange), registry)
 	am.PriceHistogram = metrics.GetOrRegisterHistogram(fmt.Sprintf("%[1]s.%[2]s.prices", adapterOrAccount, exchange), registry, metrics.NewExpDecaySample(1028, 0.015))
+	am.MarkupMetrics = map[openrtb_ext.BidType]*MarkupDeliveryMetrics{
+		openrtb_ext.BidTypeBanner: makeDeliveryMetrics(registry, adapterOrAccount+"."+exchange, openrtb_ext.BidTypeBanner),
+		openrtb_ext.BidTypeVideo:  makeDeliveryMetrics(registry, adapterOrAccount+"."+exchange, openrtb_ext.BidTypeVideo),
+		openrtb_ext.BidTypeAudio:  makeDeliveryMetrics(registry, adapterOrAccount+"."+exchange, openrtb_ext.BidTypeAudio),
+		openrtb_ext.BidTypeNative: makeDeliveryMetrics(registry, adapterOrAccount+"."+exchange, openrtb_ext.BidTypeNative),
+	}
+	for err := range am.ErrorMeters {
+		am.ErrorMeters[err] = metrics.GetOrRegisterMeter(fmt.Sprintf("%s.%s.requests.%s", adapterOrAccount, exchange, err), registry)
+	}
 	if adapterOrAccount != "adapter" {
 		am.BidsReceivedMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.bids_received", adapterOrAccount, exchange), registry)
 	}
+	am.PanicMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("%[1]s.%[2]s.requests.panic", adapterOrAccount, exchange), registry)
+}
 
+func makeDeliveryMetrics(registry metrics.Registry, prefix string, bidType openrtb_ext.BidType) *MarkupDeliveryMetrics {
+	return &MarkupDeliveryMetrics{
+		AdmMeter:  metrics.GetOrRegisterMeter(prefix+"."+string(bidType)+".adm_bids_received", registry),
+		NurlMeter: metrics.GetOrRegisterMeter(prefix+"."+string(bidType)+".nurl_bids_received", registry),
+	}
 }
 
 // getAccountMetrics gets or registers the account metrics for account "id".
@@ -175,13 +289,15 @@ func (me *Metrics) getAccountMetrics(id string) *accountMetrics {
 		return am
 	}
 	am = &accountMetrics{}
-	am.requestMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("account.%s.requests", id), me.metricsRegistry)
-	am.bidsReceivedMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("account.%s.bids_received", id), me.metricsRegistry)
-	am.priceHistogram = metrics.GetOrRegisterHistogram(fmt.Sprintf("account.%s.prices", id), me.metricsRegistry, metrics.NewExpDecaySample(1028, 0.015))
+	am.requestMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("account.%s.requests", id), me.MetricsRegistry)
+	am.bidsReceivedMeter = metrics.GetOrRegisterMeter(fmt.Sprintf("account.%s.bids_received", id), me.MetricsRegistry)
+	am.priceHistogram = metrics.GetOrRegisterHistogram(fmt.Sprintf("account.%s.prices", id), me.MetricsRegistry, metrics.NewExpDecaySample(1028, 0.015))
 	am.adapterMetrics = make(map[openrtb_ext.BidderName]*AdapterMetrics, len(me.exchanges))
-	for _, a := range me.exchanges {
-		am.adapterMetrics[a] = makeBlankAdapterMetrics(me.metricsRegistry, a)
-		registerAdapterMetrics(me.metricsRegistry, fmt.Sprintf("account.%s", id), string(a), am.adapterMetrics[a])
+	if !me.MetricsDisabled.AccountAdapterDetails {
+		for _, a := range me.exchanges {
+			am.adapterMetrics[a] = makeBlankAdapterMetrics()
+			registerAdapterMetrics(me.MetricsRegistry, fmt.Sprintf("account.%s", id), string(a), am.adapterMetrics[a])
+		}
 	}
 
 	me.accountMetrics[id] = am
@@ -193,7 +309,7 @@ func (me *Metrics) getAccountMetrics(id string) *accountMetrics {
 
 // RecordRequest implements a part of the MetricsEngine interface
 func (me *Metrics) RecordRequest(labels Labels) {
-	me.RequestMeter.Mark(1)
+	me.RequestStatuses[labels.RType][labels.RequestStatus].Mark(1)
 	if labels.Source == DemandApp {
 		me.AppRequestMeter.Mark(1)
 	} else {
@@ -210,18 +326,46 @@ func (me *Metrics) RecordRequest(labels Labels) {
 			me.NoCookieMeter.Mark(1)
 		}
 	}
-	switch labels.RType {
-	case ReqTypeORTB2:
-		me.ORTBRequestMeter.Mark(1)
-	case ReqTypeAMP:
-		me.AmpRequestMeter.Mark(1)
-	}
-	if labels.RequestStatus == RequestStatusErr {
-		me.ErrorMeter.Mark(1)
-	}
+
 	// Handle the account metrics now.
 	am := me.getAccountMetrics(labels.PubID)
 	am.requestMeter.Mark(1)
+}
+
+func (me *Metrics) RecordImps(labels ImpLabels) {
+	me.ImpMeter.Mark(int64(1))
+	if labels.BannerImps {
+		me.ImpsTypeBanner.Mark(int64(1))
+	}
+	if labels.VideoImps {
+		me.ImpsTypeVideo.Mark(int64(1))
+	}
+	if labels.AudioImps {
+		me.ImpsTypeAudio.Mark(int64(1))
+	}
+	if labels.NativeImps {
+		me.ImpsTypeNative.Mark(int64(1))
+	}
+}
+
+func (me *Metrics) RecordLegacyImps(labels Labels, numImps int) {
+	me.LegacyImpMeter.Mark(int64(numImps))
+}
+
+func (me *Metrics) RecordConnectionAccept(success bool) {
+	if success {
+		me.ConnectionCounter.Inc(1)
+	} else {
+		me.ConnectionAcceptErrorMeter.Mark(1)
+	}
+}
+
+func (me *Metrics) RecordConnectionClose(success bool) {
+	if success {
+		me.ConnectionCounter.Dec(1)
+	} else {
+		me.ConnectionCloseErrorMeter.Mark(1)
+	}
 }
 
 // RecordRequestTime implements a part of the MetricsEngine interface. The calling code is responsible
@@ -233,6 +377,16 @@ func (me *Metrics) RecordRequestTime(labels Labels, length time.Duration) {
 	}
 }
 
+// RecordAdapterPanic implements a part of the MetricsEngine interface
+func (me *Metrics) RecordAdapterPanic(labels AdapterLabels) {
+	am, ok := me.AdapterMetrics[labels.Adapter]
+	if !ok {
+		glog.Errorf("Trying to run adapter metrics on %s: adapter metrics not found", string(labels.Adapter))
+		return
+	}
+	am.PanicMeter.Mark(1)
+}
+
 // RecordAdapterRequest implements a part of the MetricsEngine interface
 func (me *Metrics) RecordAdapterRequest(labels AdapterLabels) {
 	am, ok := me.AdapterMetrics[labels.Adapter]
@@ -240,71 +394,100 @@ func (me *Metrics) RecordAdapterRequest(labels AdapterLabels) {
 		glog.Errorf("Trying to run adapter metrics on %s: adapter metrics not found", string(labels.Adapter))
 		return
 	}
-	// Adapter metrics
-	am.RequestMeter.Mark(1)
-	// Account-Adapter metrics
-	aam := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]
-	aam.RequestMeter.Mark(1)
 
-	switch labels.AdapterStatus {
-	case AdapterStatusErr:
-		am.ErrorMeter.Mark(1)
-	case AdapterStatusNoBid:
+	aam, ok := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]
+	switch labels.AdapterBids {
+	case AdapterBidNone:
 		am.NoBidMeter.Mark(1)
-	case AdapterStatusTimeout:
-		am.TimeoutMeter.Mark(1)
+		if ok {
+			aam.NoBidMeter.Mark(1)
+		}
+	case AdapterBidPresent:
+		am.GotBidsMeter.Mark(1)
+		if ok {
+			aam.GotBidsMeter.Mark(1)
+		}
+	default:
+		glog.Warningf("No go-metrics logged for AdapterBids value: %s", labels.AdapterBids)
 	}
+	for errType := range labels.AdapterErrors {
+		am.ErrorMeters[errType].Mark(1)
+	}
+
 	if labels.CookieFlag == CookieFlagNo {
 		am.NoCookieMeter.Mark(1)
 	}
 }
 
-// RecordAdapterBidsReceived implements a part of the MetricsEngine interface. This tracks the number of bids received
-// from a bidder.
-func (me *Metrics) RecordAdapterBidsReceived(labels AdapterLabels, bids int64) {
+// RecordAdapterBidReceived implements a part of the MetricsEngine interface.
+// This tracks how many bids from each Bidder use `adm` vs. `nurl.
+func (me *Metrics) RecordAdapterBidReceived(labels AdapterLabels, bidType openrtb_ext.BidType, hasAdm bool) {
 	am, ok := me.AdapterMetrics[labels.Adapter]
 	if !ok {
-		glog.Errorf("Trying to run adapter metrics on %s: adapter metrics not found", string(labels.Adapter))
+		glog.Errorf("Trying to run adapter bid metrics on %s: adapter metrics not found", string(labels.Adapter))
 		return
 	}
+
 	// Adapter metrics
-	am.BidsReceivedMeter.Mark(bids)
+	am.BidsReceivedMeter.Mark(1)
 	// Account-Adapter metrics
-	aam := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]
-	aam.BidsReceivedMeter.Mark(bids)
+	if aam, ok := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]; ok {
+		aam.BidsReceivedMeter.Mark(1)
+	}
+
+	if metricsForType, ok := am.MarkupMetrics[bidType]; ok {
+		if hasAdm {
+			metricsForType.AdmMeter.Mark(1)
+		} else {
+			metricsForType.NurlMeter.Mark(1)
+		}
+	} else {
+		glog.Errorf("bid/adm metrics map entry does not exist for type %s. This is a bug, and should be reported.", bidType)
+	}
+	return
 }
 
 // RecordAdapterPrice implements a part of the MetricsEngine interface. Generates a histogram of winning bid prices
 func (me *Metrics) RecordAdapterPrice(labels AdapterLabels, cpm float64) {
 	am, ok := me.AdapterMetrics[labels.Adapter]
 	if !ok {
-		glog.Errorf("Trying to run adapter metrics on %s: adapter metrics not found", string(labels.Adapter))
+		glog.Errorf("Trying to run adapter price metrics on %s: adapter metrics not found", string(labels.Adapter))
 		return
 	}
 	// Adapter metrics
 	am.PriceHistogram.Update(int64(cpm))
 	// Account-Adapter metrics
-	aam := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]
-	aam.PriceHistogram.Update(int64(cpm))
+	if aam, ok := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]; ok {
+		aam.PriceHistogram.Update(int64(cpm))
+	}
 }
 
 // RecordAdapterTime implements a part of the MetricsEngine interface. Records the adapter response time
 func (me *Metrics) RecordAdapterTime(labels AdapterLabels, length time.Duration) {
 	am, ok := me.AdapterMetrics[labels.Adapter]
 	if !ok {
-		glog.Errorf("Trying to run adapter metrics on %s: adapter metrics not found", string(labels.Adapter))
+		glog.Errorf("Trying to run adapter latency metrics on %s: adapter metrics not found", string(labels.Adapter))
 		return
 	}
 	// Adapter metrics
 	am.RequestTimer.Update(length)
 	// Account-Adapter metrics
-	aam := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]
-	aam.RequestTimer.Update(length)
+	if aam, ok := me.getAccountMetrics(labels.PubID).adapterMetrics[labels.Adapter]; ok {
+		aam.RequestTimer.Update(length)
+	}
 }
 
 // RecordCookieSync implements a part of the MetricsEngine interface. Records a cookie sync request
-func (me *Metrics) RecordCookieSync(labels Labels) {
+func (me *Metrics) RecordCookieSync() {
 	me.CookieSyncMeter.Mark(1)
+}
+
+// RecordAdapterCookieSync implements a part of the MetricsEngine interface. Records a cookie sync adpter sync request and gdpr status
+func (me *Metrics) RecordAdapterCookieSync(adapter openrtb_ext.BidderName, gdprBlocked bool) {
+	me.CookieSyncGen[adapter].Mark(1)
+	if gdprBlocked {
+		me.CookieSyncGDPRPrevent[adapter].Mark(1)
+	}
 }
 
 // RecordUserIDSet implements a part of the MetricsEngine interface. Records a cookie setuid request
@@ -312,247 +495,42 @@ func (me *Metrics) RecordUserIDSet(userLabels UserLabels) {
 	switch userLabels.Action {
 	case RequestActionOptOut:
 		me.userSyncOptout.Mark(1)
-		return
 	case RequestActionErr:
 		me.userSyncBadRequest.Mark(1)
-		return
 	case RequestActionSet:
-		met, ok := me.userSyncSet[userLabels.Bidder]
-		if ok {
-			met.Mark(1)
-		} else {
-			me.userSyncSet[unknownBidder].Mark(1)
-		}
-
+		doMark(userLabels.Bidder, me.userSyncSet)
+	case RequestActionGDPR:
+		doMark(userLabels.Bidder, me.userSyncGDPRPrevent)
 	}
 }
 
-// Set up blank metrics objects so we can add/subtract active metrics without refactoring a lot of code.
-// This will be useful when removing endpoints, we can just run will the blank metrics function
-// rather than loading legacy metrics that never get filled.
-// This will also eventually let us configure metrics, such as setting a limited set of metrics
-// for a production instance, and then expanding again when we need more debugging.
-
-// A blank metrics Meter type
-type blankMeter int
-
-func (m blankMeter) Count() int64 {
-	return 0
+// RecordStoredReqCacheResult implements a part of the MetricsEngine interface. Records the
+// cache hits and misses when looking up stored requests
+func (me *Metrics) RecordStoredReqCacheResult(cacheResult CacheResult, inc int) {
+	me.StoredReqCacheMeter[cacheResult].Mark(int64(inc))
 }
 
-func (m blankMeter) Mark(i int64) {
-	return
+// RecordStoredImpCacheResult implements a part of the MetricsEngine interface. Records the
+// cache hits and misses when looking up stored impressions.
+func (me *Metrics) RecordStoredImpCacheResult(cacheResult CacheResult, inc int) {
+	me.StoredImpCacheMeter[cacheResult].Mark(int64(inc))
 }
 
-func (m blankMeter) Rate1() float64 {
-	return 0.0
+// RecordPrebidCacheRequestTime implements a part of the MetricsEngine interface. Records the
+// amount of time taken to store the auction result in Prebid Cache.
+func (me *Metrics) RecordPrebidCacheRequestTime(success bool, length time.Duration) {
+	if success {
+		me.PrebidCacheRequestTimerSuccess.Update(length)
+	} else {
+		me.PrebidCacheRequestTimerError.Update(length)
+	}
 }
 
-func (m blankMeter) Rate5() float64 {
-	return 0.0
-}
-
-func (m blankMeter) Rate15() float64 {
-	return 0.0
-}
-
-func (m blankMeter) RateMean() float64 {
-	return 0.0
-}
-
-func (m blankMeter) Snapshot() metrics.Meter {
-	return m
-}
-
-func (m blankMeter) Stop() {
-	return
-}
-
-// A blank metrics Timer type
-type blankTimer int
-
-func (t blankTimer) Count() int64 {
-	return 0
-}
-
-func (t blankTimer) Max() int64 {
-	return 0
-}
-
-func (t blankTimer) Mean() float64 {
-	return 0.0
-}
-
-func (t blankTimer) Min() int64 {
-	return 0
-}
-
-func (t blankTimer) Percentile(p float64) float64 {
-	return 0.0
-}
-
-func (t blankTimer) Percentiles(p []float64) []float64 {
-	return p
-}
-
-func (t blankTimer) Rate1() float64 {
-	return 0.0
-}
-
-func (t blankTimer) Rate5() float64 {
-	return 0.0
-}
-
-func (t blankTimer) Rate15() float64 {
-	return 0.0
-}
-
-func (t blankTimer) RateMean() float64 {
-	return 0.0
-}
-
-func (t blankTimer) Snapshot() metrics.Timer {
-	return t
-}
-
-func (t blankTimer) StdDev() float64 {
-	return 0.0
-}
-
-func (t blankTimer) Stop() {
-	return
-}
-
-func (t blankTimer) Sum() int64 {
-	return 0
-}
-
-func (t blankTimer) Time(f func()) {
-	return
-}
-
-func (t blankTimer) Update(tt time.Duration) {
-	return
-}
-
-func (t blankTimer) UpdateSince(time.Time) {
-	return
-}
-
-func (t blankTimer) Variance() float64 {
-	return 0.0
-}
-
-// a blank metrics Histogram type
-type blankHistogram int
-
-func (h blankHistogram) Clear() {
-	return
-}
-
-func (h blankHistogram) Count() int64 {
-	return 0
-}
-
-func (h blankHistogram) Max() int64 {
-	return 0
-}
-
-func (h blankHistogram) Mean() float64 {
-	return 0.0
-}
-
-func (h blankHistogram) Min() int64 {
-	return 0
-}
-
-func (h blankHistogram) Percentile(f float64) float64 {
-	return 0.0
-}
-
-func (h blankHistogram) Percentiles(p []float64) []float64 {
-	return p
-}
-
-func (h blankHistogram) Sample() metrics.Sample {
-	return blankSample(0)
-}
-
-func (h blankHistogram) Snapshot() metrics.Histogram {
-	return h
-}
-
-func (h blankHistogram) StdDev() float64 {
-	return 0.0
-}
-
-func (h blankHistogram) Sum() int64 {
-	return 0
-}
-
-func (h blankHistogram) Update(int64) {
-	return
-}
-
-func (h blankHistogram) Variance() float64 {
-	return 0.0
-}
-
-// Need a blank sample for the Histogram
-type blankSample int
-
-func (h blankSample) Clear() {
-	return
-}
-
-func (h blankSample) Count() int64 {
-	return 0
-}
-
-func (h blankSample) Max() int64 {
-	return 0
-}
-
-func (h blankSample) Mean() float64 {
-	return 0.0
-}
-
-func (h blankSample) Min() int64 {
-	return 0
-}
-
-func (h blankSample) Percentile(f float64) float64 {
-	return 0.0
-}
-
-func (h blankSample) Percentiles(p []float64) []float64 {
-	return p
-}
-
-func (h blankSample) Size() int {
-	return 0
-}
-
-func (h blankSample) Snapshot() metrics.Sample {
-	return h
-}
-
-func (h blankSample) StdDev() float64 {
-	return 0.0
-}
-
-func (h blankSample) Sum() int64 {
-	return 0
-}
-
-func (h blankSample) Update(int64) {
-	return
-}
-
-func (h blankSample) Values() []int64 {
-	return []int64{}
-}
-
-func (h blankSample) Variance() float64 {
-	return 0.0
+func doMark(bidder openrtb_ext.BidderName, meters map[openrtb_ext.BidderName]metrics.Meter) {
+	met, ok := meters[bidder]
+	if ok {
+		met.Mark(1)
+	} else {
+		meters[unknownBidder].Mark(1)
+	}
 }

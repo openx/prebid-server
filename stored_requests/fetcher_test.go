@@ -1,139 +1,237 @@
 package stored_requests
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/prebid/prebid-server/pbsmetrics"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
-func TestPerfectCache(t *testing.T) {
-	cache := &mockCache{
-		mockGetData: map[string]json.RawMessage{
-			"known": json.RawMessage(`{}`),
-		},
-	}
+func setupFetcherWithCacheDeps() (*mockCache, *mockFetcher, AllFetcher, *pbsmetrics.MetricsEngineMock) {
+	cache := &mockCache{}
+	metricsEngine := &pbsmetrics.MetricsEngineMock{}
 	fetcher := &mockFetcher{}
-	composed := WithCache(fetcher, cache)
-	ids := []string{"known"}
-	composed.FetchRequests(context.Background(), ids)
+	afetcherWithCache := WithCache(fetcher, cache, metricsEngine)
 
-	if len(cache.gotGetIds) != 1 {
-		t.Errorf("The cache called with the wrong number of IDs. Expected 1, got %d.", len(cache.gotGetIds))
-	}
-	if cache.gotGetIds[0] != "known" {
-		t.Errorf(`The cache called with the wrong ID. Expected "known", got %s.`, cache.gotGetIds[0])
-	}
-	if len(fetcher.gotRequest) != 0 {
-		t.Errorf("The delegate fetcher should not have been called with any IDs. Got %#v", fetcher.gotRequest)
-	}
+	return cache, fetcher, afetcherWithCache, metricsEngine
+}
+
+func TestPerfectCache(t *testing.T) {
+	cache, fetcher, aFetcherWithCache, metricsEngine := setupFetcherWithCacheDeps()
+	impIDs := []string{"known"}
+	reqIDs := []string{"req-id"}
+	ctx := context.Background()
+
+	cache.On("Get", ctx, reqIDs, impIDs).Return(
+		map[string]json.RawMessage{
+			"req-id": json.RawMessage(`{"req":true}`),
+		},
+		map[string]json.RawMessage{
+			"known": json.RawMessage(`{}`),
+		})
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheHit, 1)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheMiss, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheHit, 1)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheMiss, 0)
+
+	reqData, impData, errs := aFetcherWithCache.FetchRequests(ctx, reqIDs, impIDs)
+
+	cache.AssertExpectations(t)
+	fetcher.AssertExpectations(t)
+	metricsEngine.AssertExpectations(t)
+	assert.JSONEq(t, `{"req":true}`, string(reqData["req-id"]), "Fetch requests should fetch the right request data")
+	assert.JSONEq(t, `{}`, string(impData["known"]), "FetchRequests should fetch the right imp data")
+	assert.Len(t, errs, 0, "FetchRequest shouldn't return any errors")
 }
 
 func TestImperfectCache(t *testing.T) {
-	cache := &mockCache{
-		mockGetData: map[string]json.RawMessage{
+	cache, fetcher, aFetcherWithCache, metricsEngine := setupFetcherWithCacheDeps()
+	impIDs := []string{"cached", "uncached"}
+	ctx := context.Background()
+
+	cache.On("Get", ctx, []string(nil), impIDs).Return(
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{
 			"cached": json.RawMessage(`true`),
-		},
-	}
-	fetcher := &mockFetcher{
-		returnData: map[string]json.RawMessage{
+		})
+
+	fetcher.On("FetchRequests", ctx, []string{}, []string{"uncached"}).Return(
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{
 			"uncached": json.RawMessage(`false`),
 		},
-	}
-	composed := WithCache(fetcher, cache)
-	ids := []string{"cached", "uncached"}
-	fetchedData, errs := composed.FetchRequests(context.Background(), ids)
+		[]error{},
+	)
+	cache.On("Save", ctx,
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{
+			"uncached": json.RawMessage(`false`),
+		})
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheHit, 0)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheMiss, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheHit, 1)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheMiss, 1)
 
-	if len(cache.gotGetIds) != 2 {
-		t.Errorf("The cache called with the wrong number of IDs. Expected 2, got %d.", len(cache.gotGetIds))
-	}
-	if cache.gotGetIds[0] != "cached" {
-		t.Errorf(`Wrong cache.get on id[0]. Expected "cached", got %s.`, cache.gotGetIds[0])
-	}
-	if cache.gotGetIds[1] != "uncached" {
-		t.Errorf(`Wrong cache.get on id[1]. Expected "uncached", got %s.`, cache.gotGetIds[1])
-	}
-	if !bytes.Equal(cache.gotSaveValues["uncached"], []byte("false")) {
-		t.Errorf("Failed to save cache miss data. Expected false, got %s", cache.gotSaveValues["uncached"])
-	}
+	reqData, impData, errs := aFetcherWithCache.FetchRequests(ctx, nil, impIDs)
 
-	if len(fetcher.gotRequest) != 1 {
-		t.Errorf("The delegate fetcher should have been called with 1 ID. Got %d.", len(fetcher.gotRequest))
-	}
-
-	if fetcher.gotRequest[0] != "uncached" {
-		t.Errorf("The delegate fetcher was called with the wrong id. Expected uncached, got %s", fetcher.gotRequest[0])
-	}
-	if len(errs) != 0 {
-		t.Errorf("Got unexpected errors: %v", errs)
-	}
-	if len(fetchedData) != 2 {
-		t.Errorf("Unexpected data fetched. Expected 2 entries, but got %d", len(fetchedData))
-	}
-	if cachedData, _ := fetchedData["cached"]; !bytes.Equal(cachedData, []byte("true")) {
-		t.Errorf("Cached data was corrupted. Expected true, got %s", string(cachedData))
-	}
-	if cachedData, _ := fetchedData["uncached"]; !bytes.Equal(cachedData, []byte("false")) {
-		t.Errorf("Uncached data was corrupted. Expected false, got %s", string(cachedData))
-	}
+	cache.AssertExpectations(t)
+	fetcher.AssertExpectations(t)
+	metricsEngine.AssertExpectations(t)
+	assert.Len(t, reqData, 0, "Fetch requests should return nil if no request IDs were passed")
+	assert.JSONEq(t, `true`, string(impData["cached"]), "FetchRequests should fetch the right imp data")
+	assert.JSONEq(t, `false`, string(impData["uncached"]), "FetchRequests should fetch the right imp data")
+	assert.Len(t, errs, 0, "FetchRequest shouldn't return any errors")
 }
 
 func TestMissingData(t *testing.T) {
-	cache := &mockCache{}
-	fetcher := &mockFetcher{
-		returnErrs: []error{errors.New("Data not found")},
-	}
-	composed := WithCache(fetcher, cache)
-	fetchedData, errs := composed.FetchRequests(context.Background(), []string{"unknown"})
-	if len(errs) != 1 {
-		t.Errorf("Errors from the delegate fetcher should be returned. Got %d errors.", len(errs))
-	}
-	if errs[0].Error() != "Data not found" {
-		t.Errorf(`Unexpected error message. Expected "Data not found", got "%s"`, errs[0].Error())
-	}
-	if len(fetchedData) != 0 {
-		t.Errorf("WithCache inserted unexpected data: %v", fetchedData)
-	}
+	cache, fetcher, aFetcherWithCache, metricsEngine := setupFetcherWithCacheDeps()
+	impIDs := []string{"unknown"}
+	ctx := context.Background()
+
+	cache.On("Get", ctx, []string(nil), impIDs).Return(
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{},
+	)
+	fetcher.On("FetchRequests", ctx, []string{}, impIDs).Return(
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{},
+		[]error{
+			errors.New("Data not found"),
+		},
+	)
+	cache.On("Save", ctx,
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{},
+	)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheHit, 0)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheMiss, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheHit, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheMiss, 1)
+
+	reqData, impData, errs := aFetcherWithCache.FetchRequests(ctx, nil, impIDs)
+
+	cache.AssertExpectations(t)
+	fetcher.AssertExpectations(t)
+	metricsEngine.AssertExpectations(t)
+	assert.Len(t, errs, 1, "FetchRequests for missing data should return an error")
+	assert.Len(t, reqData, 0, "FetchRequests for missing data shouldn't return anything")
+	assert.Len(t, impData, 0, "FetchRequests for missing data shouldn't return anything")
 }
 
 // Prevents #311
 func TestCacheSaves(t *testing.T) {
-	cache := &mockCache{
-		mockGetData: map[string]json.RawMessage{
+	cache, fetcher, aFetcherWithCache, metricsEngine := setupFetcherWithCacheDeps()
+	impIDs := []string{"abc", "abc"}
+	ctx := context.Background()
+
+	cache.On("Get", ctx, []string(nil), impIDs).Return(
+		map[string]json.RawMessage{},
+		map[string]json.RawMessage{
 			"abc": json.RawMessage(`{}`),
-		},
-	}
+		})
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheHit, 0)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheMiss, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheHit, 2)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheMiss, 0)
+
+	_, impData, errs := aFetcherWithCache.FetchRequests(ctx, nil, []string{"abc", "abc"})
+
+	cache.AssertExpectations(t)
+	fetcher.AssertExpectations(t)
+	metricsEngine.AssertExpectations(t)
+	assert.Len(t, impData, 1, "FetchRequests should return data only once for duplicate requests")
+	assert.JSONEq(t, `{}`, string(impData["abc"]), "FetchRequests should fetch the right imp data")
+	assert.Len(t, errs, 0, "FetchRequests with duplicate IDs shouldn't return an error")
+}
+
+func TestComposedCache(t *testing.T) {
+	c1 := &mockCache{}
+	c2 := &mockCache{}
+	c3 := &mockCache{}
+	c4 := &mockCache{}
+	cache := ComposedCache{c1, c2, c3, c4}
+	metricsEngine := &pbsmetrics.MetricsEngineMock{}
 	fetcher := &mockFetcher{}
-	composed := WithCache(fetcher, cache)
-	composed.FetchRequests(context.Background(), []string{"abc", "abc"})
-	if len(fetcher.gotRequest) != 0 {
-		t.Errorf("No IDs should be requested from the fetcher for requests with duplicate ID. Got %#v", fetcher.gotRequest)
-	}
+	aFetcherWithCache := WithCache(fetcher, cache, metricsEngine)
+	impIDs := []string{"1", "2", "3"}
+	reqIDs := []string{"1", "2", "3"}
+	ctx := context.Background()
+
+	c1.On("Get", ctx, reqIDs, impIDs).Return(
+		map[string]json.RawMessage{
+			"1": json.RawMessage(`{"id": "1"}`),
+		},
+		map[string]json.RawMessage{
+			"1": json.RawMessage(`{"id": "1"}`),
+		})
+	c2.On("Get", ctx, []string{"2", "3"}, []string{"2", "3"}).Return(
+		map[string]json.RawMessage{
+			"2": json.RawMessage(`{"id": "2"}`),
+		},
+		map[string]json.RawMessage{
+			"2": json.RawMessage(`{"id": "2"}`),
+		})
+	c3.On("Get", ctx, []string{"3"}, []string{"3"}).Return(
+		map[string]json.RawMessage{
+			"3": json.RawMessage(`{"id": "3"}`),
+		},
+		map[string]json.RawMessage{
+			"3": json.RawMessage(`{"id": "3"}`),
+		})
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheHit, 3)
+	metricsEngine.On("RecordStoredReqCacheResult", pbsmetrics.CacheMiss, 0)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheHit, 3)
+	metricsEngine.On("RecordStoredImpCacheResult", pbsmetrics.CacheMiss, 0)
+
+	reqData, impData, errs := aFetcherWithCache.FetchRequests(ctx, reqIDs, impIDs)
+
+	c1.AssertExpectations(t)
+	c2.AssertExpectations(t)
+	c3.AssertExpectations(t)
+	fetcher.AssertExpectations(t)
+	metricsEngine.AssertExpectations(t)
+	assert.Len(t, reqData, len(reqIDs), "FetchRequests should be able to return all request data from a composed cache")
+	assert.Len(t, impData, len(impIDs), "FetchRequests should be able to return all imp data from a composed cache")
+	assert.Len(t, errs, 0, "FetchRequests shouldn't return an error when trying to use a composed cache")
+	assert.JSONEq(t, `{"id": "1"}`, string(impData["1"]), "FetchRequests should fetch the right imp data")
+	assert.JSONEq(t, `{"id": "2"}`, string(impData["2"]), "FetchRequests should fetch the right imp data")
+	assert.JSONEq(t, `{"id": "3"}`, string(impData["3"]), "FetchRequests should fetch the right imp data")
+	assert.JSONEq(t, `{"id": "1"}`, string(reqData["1"]), "FetchRequests should fetch the right req data")
+	assert.JSONEq(t, `{"id": "2"}`, string(reqData["2"]), "FetchRequests should fetch the right req data")
+	assert.JSONEq(t, `{"id": "3"}`, string(reqData["3"]), "FetchRequests should fetch the right req data")
 }
 
 type mockFetcher struct {
-	returnData map[string]json.RawMessage
-	returnErrs []error
-	gotRequest []string
+	mock.Mock
 }
 
-func (f *mockFetcher) FetchRequests(ctx context.Context, ids []string) (map[string]json.RawMessage, []error) {
-	f.gotRequest = ids
-	return f.returnData, f.returnErrs
+func (f *mockFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (map[string]json.RawMessage, map[string]json.RawMessage, []error) {
+	args := f.Called(ctx, requestIDs, impIDs)
+	return args.Get(0).(map[string]json.RawMessage), args.Get(1).(map[string]json.RawMessage), args.Get(2).([]error)
+}
+
+func (f *mockFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {
+	return "", nil
 }
 
 type mockCache struct {
-	gotSaveValues map[string]json.RawMessage
-	gotGetIds     []string
-	mockGetData   map[string]json.RawMessage
+	mock.Mock
 }
 
-func (c *mockCache) GetRequests(ctx context.Context, ids []string) map[string]json.RawMessage {
-	c.gotGetIds = ids
-	return c.mockGetData
+func (c *mockCache) Get(ctx context.Context, requestIDs []string, impIDs []string) (map[string]json.RawMessage, map[string]json.RawMessage) {
+	args := c.Called(ctx, requestIDs, impIDs)
+	return args.Get(0).(map[string]json.RawMessage), args.Get(1).(map[string]json.RawMessage)
 }
 
-func (c *mockCache) SaveRequests(ctx context.Context, values map[string]json.RawMessage) {
-	c.gotSaveValues = values
+func (c *mockCache) Save(ctx context.Context, storedRequests map[string]json.RawMessage, storedImps map[string]json.RawMessage) {
+	c.Called(ctx, storedRequests, storedImps)
+}
+
+func (c *mockCache) Invalidate(ctx context.Context, requestIDs []string, impIDs []string) {
+	c.Called(ctx, requestIDs, impIDs)
 }

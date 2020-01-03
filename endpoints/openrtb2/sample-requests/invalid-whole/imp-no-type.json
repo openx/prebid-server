@@ -1,8 +1,14 @@
 {
+  "message": "Invalid request: request.imp[0] must contain at least one of \"banner\", \"video\", \"audio\", or \"native\"\n",
+  "requestPayload": {
     "id":"req-id",
     "imp": [
-        {
-            "id":"imp-id"
-        }
-    ]
+      {
+        "id":"imp-id"
+      }
+    ],
+    "app": {
+      "id": "app_001"
+    }
+  }
 }

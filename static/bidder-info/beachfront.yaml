@@ -1,0 +1,11 @@
+maintainer:
+  email: "prebid@beachfront.com"
+capabilities:
+  app:
+    mediaTypes:
+      - banner
+      - video
+  site:
+    mediaTypes:
+      - banner
+      - video

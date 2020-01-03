@@ -1,9 +1,10 @@
 package adform
 
 import (
-	"github.com/mxmCherry/openrtb"
-	"github.com/prebid/prebid-server/openrtb_ext"
+	"encoding/json"
 	"testing"
+
+	"github.com/prebid/prebid-server/openrtb_ext"
 )
 
 // This file actually intends to test static/bidder-params/adform.json
@@ -18,7 +19,7 @@ func TestValidParams(t *testing.T) {
 	}
 
 	for _, validParam := range validParams {
-		if err := validator.Validate(openrtb_ext.BidderAdform, openrtb.RawJSON(validParam)); err != nil {
+		if err := validator.Validate(openrtb_ext.BidderAdform, json.RawMessage(validParam)); err != nil {
 			t.Errorf("Schema rejected adform params: %s", validParam)
 		}
 	}
@@ -32,7 +33,7 @@ func TestInvalidParams(t *testing.T) {
 	}
 
 	for _, invalidParam := range invalidParams {
-		if err := validator.Validate(openrtb_ext.BidderAdform, openrtb.RawJSON(invalidParam)); err == nil {
+		if err := validator.Validate(openrtb_ext.BidderAdform, json.RawMessage(invalidParam)); err == nil {
 			t.Errorf("Schema allowed unexpected params: %s", invalidParam)
 		}
 	}
@@ -41,6 +42,12 @@ func TestInvalidParams(t *testing.T) {
 var validParams = []string{
 	`{"mid":123}`,
 	`{"mid":"123"}`,
+	`{"mid":123,"priceType":"gross"}`,
+	`{"mid":"123","priceType":"net"}`,
+	`{"mid":"123","mkv":" color :blue , length : 350"}`,
+	`{"mid":"123","mkv":"color:"}`,
+	`{"mid":"123","mkw":"green,male"}`,
+	`{"mid":"123","mkv":" ","mkw":" "}`,
 }
 
 var invalidParams = []string{
@@ -52,4 +59,11 @@ var invalidParams = []string{
 	`[]`,
 	`{}`,
 	`{"notmid":"123"}`,
+	`{"mid":"123","priceType":"ne"}`,
+	`{"mid":"123","mkv":"color:blue,:350"}`,
+	`{"mid":"123","mkv":"color:blue;length:350"}`,
+	`{"mid":"123","mkv":"color"}`,
+	`{"mid":"123","mkv":"color:blue,l&ngth:350"}`,
+	`{"mid":"123","mkv":"color::blue"}`,
+	`{"mid":"123","mkw":"fem&le"}`,
 }

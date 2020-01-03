@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,14 +10,28 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prebid/prebid-server/adapters"
+	"github.com/prebid/prebid-server/currencies"
+	"github.com/prebid/prebid-server/prebid_cache_client"
+	"github.com/prebid/prebid-server/stored_requests"
+	"github.com/prebid/prebid-server/stored_requests/backends/file_fetcher"
+
+	"github.com/buger/jsonparser"
 	"github.com/mxmCherry/openrtb"
 	"github.com/prebid/prebid-server/config"
+	"github.com/prebid/prebid-server/gdpr"
 	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/pbsmetrics"
+	metricsConf "github.com/prebid/prebid-server/pbsmetrics/config"
+	pbc "github.com/prebid/prebid-server/prebid_cache_client"
 	"github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/assert"
+	"github.com/yudai/gojsondiff"
+	"github.com/yudai/gojsondiff/formatter"
 )
 
 func TestNewExchange(t *testing.T) {
@@ -31,9 +46,10 @@ func TestNewExchange(t *testing.T) {
 		CacheURL: config.Cache{
 			ExpectedTimeMillis: 20,
 		},
+		Adapters: blankAdapterConfig(openrtb_ext.BidderList()),
 	}
 
-	e := NewExchange(server.Client(), nil, cfg, pbsmetrics.NewMetrics(metrics.NewRegistry(), knownAdapters)).(*exchange)
+	e := NewExchange(server.Client(), nil, cfg, pbsmetrics.NewMetrics(metrics.NewRegistry(), knownAdapters, config.DisabledMetrics{}), adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault()).(*exchange)
 	for _, bidderName := range knownAdapters {
 		if _, ok := e.adapterMap[bidderName]; !ok {
 			t.Errorf("NewExchange produced an Exchange without bidder %s", bidderName)
@@ -42,6 +58,307 @@ func TestNewExchange(t *testing.T) {
 	if e.cacheTime != time.Duration(cfg.CacheURL.ExpectedTimeMillis)*time.Millisecond {
 		t.Errorf("Bad cacheTime. Expected 20 ms, got %s", e.cacheTime.String())
 	}
+}
+
+// The objective is to get to execute e.buildBidResponse(ctx.Background(), liveA... ) (*openrtb.BidResponse, error)
+// and check whether the returned request successfully prints any '&' characters as it should
+// To do so, we:
+// 	1) Write the endpoint adapter URL with an '&' character into a new config,Configuration struct
+// 	   as specified in https://github.com/prebid/prebid-server/issues/465
+// 	2) Initialize a new exchange with said configuration
+// 	3) Build all the parameters e.buildBidResponse(ctx.Background(), liveA... ) needs including the
+// 	   sample request as specified in https://github.com/prebid/prebid-server/issues/465
+// 	4) Build a BidResponse struct using exchange.buildBidResponse(ctx.Background(), liveA... )
+// 	5) Assert we have no '&' characters in the response that exchange.buildBidResponse returns
+func TestCharacterEscape(t *testing.T) {
+	/* 1) Adapter with a '& char in its endpoint property 		*/
+	/*    https://github.com/prebid/prebid-server/issues/465	*/
+	cfg := &config.Configuration{
+		Adapters: make(map[string]config.Adapter, 1),
+	}
+	cfg.Adapters["appnexus"] = config.Adapter{
+		Endpoint: "http://ib.adnxs.com/openrtb2?query1&query2", //Note the '&' character in there
+	}
+
+	/* 	2) Init new exchange with said configuration			*/
+	//Other parameters also needed to create exchange
+	handlerNoBidServer := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }
+	server := httptest.NewServer(http.HandlerFunc(handlerNoBidServer))
+	defer server.Close()
+
+	e := NewExchange(server.Client(), nil, cfg, pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList(), config.DisabledMetrics{}), adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault()).(*exchange)
+
+	/* 	3) Build all the parameters e.buildBidResponse(ctx.Background(), liveA... ) needs */
+	//liveAdapters []openrtb_ext.BidderName,
+	liveAdapters := make([]openrtb_ext.BidderName, 1)
+	liveAdapters[0] = "appnexus"
+
+	//adapterBids map[openrtb_ext.BidderName]*pbsOrtbSeatBid,
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid, 1)
+	adapterBids["appnexus"] = &pbsOrtbSeatBid{currency: "USD"}
+
+	//An openrtb.BidRequest struct as specified in https://github.com/prebid/prebid-server/issues/465
+	bidRequest := &openrtb.BidRequest{
+		ID: "some-request-id",
+		Imp: []openrtb.Imp{{
+			ID:     "some-impression-id",
+			Banner: &openrtb.Banner{Format: []openrtb.Format{{W: 300, H: 250}, {W: 300, H: 600}}},
+			Ext:    json.RawMessage(`{"appnexus": {"placementId": 10433394}}`),
+		}},
+		Site:   &openrtb.Site{Page: "prebid.org", Ext: json.RawMessage(`{"amp":0}`)},
+		Device: &openrtb.Device{UA: "curl/7.54.0", IP: "::1"},
+		AT:     1,
+		TMax:   500,
+		Ext:    json.RawMessage(`{"id": "some-request-id","site": {"page": "prebid.org"},"imp": [{"id": "some-impression-id","banner": {"format": [{"w": 300,"h": 250},{"w": 300,"h": 600}]},"ext": {"appnexus": {"placementId": 10433394}}}],"tmax": 500}`),
+	}
+
+	//resolvedRequest json.RawMessage
+	resolvedRequest := json.RawMessage(`{"id": "some-request-id","site": {"page": "prebid.org"},"imp": [{"id": "some-impression-id","banner": {"format": [{"w": 300,"h": 250},{"w": 300,"h": 600}]},"ext": {"appnexus": {"placementId": 10433394}}}],"tmax": 500}`)
+
+	//adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra,
+	adapterExtra := make(map[openrtb_ext.BidderName]*seatResponseExtra, 1)
+	adapterExtra["appnexus"] = &seatResponseExtra{
+		ResponseTimeMillis: 5,
+		Errors:             []openrtb_ext.ExtBidderError{{Code: 999, Message: "Post ib.adnxs.com/openrtb2?query1&query2: unsupported protocol scheme \"\""}},
+	}
+
+	//errList []error
+	var errList []error
+
+	/* 	4) Build bid response 									*/
+	bidResp, err := e.buildBidResponse(context.Background(), liveAdapters, adapterBids, bidRequest, resolvedRequest, adapterExtra, nil, errList)
+
+	/* 	5) Assert we have no errors and one '&' character as we are supposed to 	*/
+	if err != nil {
+		t.Errorf("exchange.buildBidResponse returned unexpected error: %v", err)
+	}
+	if len(errList) > 0 {
+		t.Errorf("exchange.buildBidResponse returned %d errors", len(errList))
+	}
+	if bytes.Contains(bidResp.Ext, []byte("u0026")) {
+		t.Errorf("exchange.buildBidResponse() did not correctly print the '&' characters %s", string(bidResp.Ext))
+	}
+}
+
+func TestGetBidCacheInfo(t *testing.T) {
+	testUUID := "CACHE_UUID_1234"
+	testExternalCacheHost := "https://www.externalprebidcache.net"
+	testExternalCachePath := "endpoints/cache"
+
+	/* 1) An adapter 											*/
+	bidderName := openrtb_ext.BidderName("appnexus")
+
+	cfg := &config.Configuration{
+		Adapters: map[string]config.Adapter{
+			string(bidderName): {
+				Endpoint: "http://ib.adnxs.com/endpoint",
+			},
+		},
+		CacheURL: config.Cache{
+			Host: "www.internalprebidcache.net",
+		},
+		ExtCacheURL: config.ExternalCache{
+			Host: testExternalCacheHost,
+			Path: testExternalCachePath,
+		},
+	}
+	adapterList := make([]openrtb_ext.BidderName, 0, 2)
+	testEngine := metricsConf.NewMetricsEngine(cfg, adapterList)
+
+	/* 	2) Init new exchange with said configuration			*/
+	handlerNoBidServer := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }
+	server := httptest.NewServer(http.HandlerFunc(handlerNoBidServer))
+	defer server.Close()
+
+	e := NewExchange(server.Client(), pbc.NewClient(&cfg.CacheURL, &cfg.ExtCacheURL, testEngine), cfg, pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList(), config.DisabledMetrics{}), adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault()).(*exchange)
+
+	/* 	3) Build all the parameters e.buildBidResponse(ctx.Background(), liveA... ) needs */
+	liveAdapters := []openrtb_ext.BidderName{bidderName}
+
+	//adapterBids map[openrtb_ext.BidderName]*pbsOrtbSeatBid,
+	bids := []*openrtb.Bid{
+		{
+			ID:             "some-imp-id",
+			ImpID:          "",
+			Price:          9.517803,
+			NURL:           "",
+			BURL:           "",
+			LURL:           "",
+			AdM:            "",
+			AdID:           "",
+			ADomain:        nil,
+			Bundle:         "",
+			IURL:           "",
+			CID:            "",
+			CrID:           "",
+			Tactic:         "",
+			Cat:            nil,
+			Attr:           nil,
+			API:            0,
+			Protocol:       0,
+			QAGMediaRating: 0,
+			Language:       "",
+			DealID:         "",
+			W:              300,
+			H:              250,
+			WRatio:         0,
+			HRatio:         0,
+			Exp:            0,
+			Ext:            nil,
+		},
+	}
+	auc := &auction{
+		cacheIds: map[*openrtb.Bid]string{
+			bids[0]: testUUID,
+		},
+	}
+	aPbsOrtbBidArr := []*pbsOrtbBid{
+		{
+			bid:     bids[0],
+			bidType: openrtb_ext.BidTypeBanner,
+			bidTargets: map[string]string{
+				"pricegranularity":  "med",
+				"includewinners":    "true",
+				"includebidderkeys": "false",
+			},
+		},
+	}
+	adapterBids := map[openrtb_ext.BidderName]*pbsOrtbSeatBid{
+		bidderName: {
+			bids:     aPbsOrtbBidArr,
+			currency: "USD",
+		},
+	}
+
+	//resolvedRequest json.RawMessage
+	resolvedRequest := json.RawMessage(`{"id": "some-request-id","site": {"page": "prebid.org"},"imp": [{"id": "some-impression-id","banner": {"format": [{"w": 300,"h": 250},{"w": 300,"h": 600}]},"ext": {"appnexus": {"placementId": 10433394}}}],"tmax": 500}`)
+
+	//adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra,
+	adapterExtra := map[openrtb_ext.BidderName]*seatResponseExtra{
+		bidderName: {
+			ResponseTimeMillis: 5,
+			Errors: []openrtb_ext.ExtBidderError{
+				{
+					Code:    999,
+					Message: "Post ib.adnxs.com/openrtb2?query1&query2: unsupported protocol scheme \"\"",
+				},
+			},
+		},
+	}
+	bidRequest := &openrtb.BidRequest{
+		ID:   "some-request-id",
+		TMax: 1000,
+		Imp: []openrtb.Imp{
+			{
+				ID:     "test-div",
+				Secure: openrtb.Int8Ptr(0),
+				Banner: &openrtb.Banner{Format: []openrtb.Format{{W: 300, H: 250}}},
+				Ext: json.RawMessage(` {
+    "rubicon": {
+        "accountId": 1001,
+        "siteId": 113932,
+        "zoneId": 535510
+    },
+    "appnexus": { "placementId": 10433394 },
+    "pubmatic": { "publisherId": "156209", "adSlot": "pubmatic_test2@300x250" },
+    "pulsepoint": { "cf": "300X250", "cp": 512379, "ct": 486653 },
+    "conversant": { "site_id": "108060" },
+    "ix": { "siteId": "287415" }
+}`),
+			},
+		},
+		Site: &openrtb.Site{
+			Page:      "http://rubitest.com/index.html",
+			Publisher: &openrtb.Publisher{ID: "1001"},
+		},
+		Test: 1,
+		Ext:  json.RawMessage(`{"prebid": { "cache": { "bids": {}, "vastxml": {} }, "targeting": { "pricegranularity": "med", "includewinners": true, "includebidderkeys": false } }}`),
+	}
+
+	var errList []error
+
+	/* 	4) Build bid response 									*/
+	bid_resp, err := e.buildBidResponse(context.Background(), liveAdapters, adapterBids, bidRequest, resolvedRequest, adapterExtra, auc, errList)
+
+	/* 	5) Assert we have no errors and the bid response we expected*/
+	assert.NoError(t, err, "[TestGetBidCacheInfo] buildBidResponse() threw an error")
+
+	expectedBidResponse := &openrtb.BidResponse{
+		SeatBid: []openrtb.SeatBid{
+			{
+				Seat: string(bidderName),
+				Bid: []openrtb.Bid{
+					{
+						Ext: json.RawMessage(`{ "prebid": { "cache": { "bids": { "cacheId": "` + testUUID + `", "url": "` + testExternalCacheHost + `/` + testExternalCachePath + `?uuid=` + testUUID + `" }, "key": "", "url": "" }`),
+					},
+				},
+			},
+		},
+	}
+	// compare cache UUID
+	expCacheUUID, err := jsonparser.GetString(expectedBidResponse.SeatBid[0].Bid[0].Ext, "prebid", "cache", "bids", "cacheId")
+	assert.NoErrorf(t, err, "[TestGetBidCacheInfo] Error found while trying to json parse the cacheId field from expected build response. Message: %v \n", err)
+
+	cacheUUID, err := jsonparser.GetString(bid_resp.SeatBid[0].Bid[0].Ext, "prebid", "cache", "bids", "cacheId")
+	assert.NoErrorf(t, err, "[TestGetBidCacheInfo] bid_resp.SeatBid[0].Bid[0].Ext = %s \n", bid_resp.SeatBid[0].Bid[0].Ext)
+
+	assert.Equal(t, expCacheUUID, cacheUUID, "[TestGetBidCacheInfo] cacheId field in ext should equal \"%s\" \n", expCacheUUID)
+
+	// compare cache UUID
+	expCacheURL, err := jsonparser.GetString(expectedBidResponse.SeatBid[0].Bid[0].Ext, "prebid", "cache", "bids", "url")
+	assert.NoErrorf(t, err, "[TestGetBidCacheInfo] Error found while trying to json parse the url field from expected build response. Message: %v \n", err)
+
+	cacheURL, err := jsonparser.GetString(bid_resp.SeatBid[0].Bid[0].Ext, "prebid", "cache", "bids", "url")
+	assert.NoErrorf(t, err, "[TestGetBidCacheInfo] Error found while trying to json parse the url field from actual build response. Message: %v \n", err)
+
+	assert.Equal(t, expCacheURL, cacheURL, "[TestGetBidCacheInfo] cacheId field in ext should equal \"%s\" \n", expCacheURL)
+}
+
+func buildBidResponseParams(bidderName openrtb_ext.BidderName, bidRequest *openrtb.BidRequest) ([]openrtb_ext.BidderName, map[openrtb_ext.BidderName]*pbsOrtbSeatBid, json.RawMessage, map[openrtb_ext.BidderName]*seatResponseExtra) {
+	//liveAdapters []openrtb_ext.BidderName,
+	liveAdapters := []openrtb_ext.BidderName{bidderName}
+
+	//adapterBids map[openrtb_ext.BidderName]*pbsOrtbSeatBid,
+	adapterBids := map[openrtb_ext.BidderName]*pbsOrtbSeatBid{
+		bidderName: {
+			bids: []*pbsOrtbBid{
+				{
+					bid: &openrtb.Bid{
+						ID:    "some-imp-id",
+						Price: 9.517803,
+						W:     300,
+						H:     250,
+					},
+					bidType: openrtb_ext.BidTypeBanner,
+					bidTargets: map[string]string{
+						"pricegranularity":  "med",
+						"includewinners":    "true",
+						"includebidderkeys": "false",
+					},
+				},
+			},
+			currency: "USD",
+			//ext:      bidRequest.Ext,
+		},
+	}
+
+	//resolvedRequest json.RawMessage
+	resolvedRequest := json.RawMessage(`{"id": "some-request-id","site": {"page": "prebid.org"},"imp": [{"id": "some-impression-id","banner": {"format": [{"w": 300,"h": 250},{"w": 300,"h": 600}]},"ext": {"appnexus": {"placementId": 10433394}}}],"tmax": 500}`)
+
+	//adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra,
+	adapterExtra := map[openrtb_ext.BidderName]*seatResponseExtra{
+		bidderName: {
+			ResponseTimeMillis: 5,
+			Errors: []openrtb_ext.ExtBidderError{
+				{
+					Code:    999,
+					Message: "Post ib.adnxs.com/openrtb2?query1&query2: unsupported protocol scheme \"\"",
+				},
+			},
+		},
+	}
+
+	return liveAdapters, adapterBids, resolvedRequest, adapterExtra
 }
 
 // TestRaceIntegration runs an integration test using all the sample params from
@@ -60,24 +377,45 @@ func TestRaceIntegration(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Configuration{
-		Adapters: map[string]config.Adapter{
-			"facebook": config.Adapter{
-				PlatformID: "abc",
-			},
-		},
+		Adapters: make(map[string]config.Adapter, len(openrtb_ext.BidderMap)),
 	}
-
-	theMetrics := pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList())
-	ex := NewExchange(server.Client(), &wellBehavedCache{}, cfg, theMetrics)
-	_, err := ex.HoldAuction(context.Background(), newRaceCheckingRequest(t), &emptyUsersync{}, pbsmetrics.Labels{})
+	for _, bidder := range openrtb_ext.BidderList() {
+		cfg.Adapters[strings.ToLower(string(bidder))] = config.Adapter{
+			Endpoint: server.URL,
+		}
+	}
+	cfg.Adapters[strings.ToLower(string(openrtb_ext.BidderFacebook))] = config.Adapter{
+		Endpoint:   server.URL,
+		PlatformID: "abc",
+	}
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+	theMetrics := pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList(), config.DisabledMetrics{})
+	ex := NewExchange(server.Client(), &wellBehavedCache{}, cfg, theMetrics, adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault())
+	_, err := ex.HoldAuction(context.Background(), newRaceCheckingRequest(t), &emptyUsersync{}, pbsmetrics.Labels{}, &categoriesFetcher)
 	if err != nil {
 		t.Errorf("HoldAuction returned unexpected error: %v", err)
 	}
 }
 
+func newCategoryFetcher(directory string) (stored_requests.CategoryFetcher, error) {
+	fetcher, err := file_fetcher.NewFileFetcher(directory)
+	if err != nil {
+		return nil, err
+	}
+	catfetcher, ok := fetcher.(stored_requests.CategoryFetcher)
+	if !ok {
+		return nil, fmt.Errorf("Failed to type cast fetcher to CategoryFetcher")
+	}
+	return catfetcher, nil
+}
+
 // newRaceCheckingRequest builds a BidRequest from all the params in the
 // adapters/{bidder}/{bidder}test/params/race/*.json files
 func newRaceCheckingRequest(t *testing.T) *openrtb.BidRequest {
+	dnt := int8(1)
 	return &openrtb.BidRequest{
 		Site: &openrtb.Site{
 			Page:   "www.some.domain.com",
@@ -85,6 +423,25 @@ func newRaceCheckingRequest(t *testing.T) *openrtb.BidRequest {
 			Publisher: &openrtb.Publisher{
 				ID: "some-publisher-id",
 			},
+		},
+		Device: &openrtb.Device{
+			UA:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/67.0.3396.87 Safari/537.36",
+			IFA:      "ifa",
+			IP:       "132.173.230.74",
+			DNT:      &dnt,
+			Language: "EN",
+		},
+		Source: &openrtb.Source{
+			TID: "61018dc9-fa61-4c41-b7dc-f90b9ae80e87",
+		},
+		User: &openrtb.User{
+			ID:       "our-id",
+			BuyerUID: "their-id",
+			Ext:      json.RawMessage(`{"consent":"BONciguONcjGKADACHENAOLS1rAHDAFAAEAASABQAMwAeACEAFw","digitrust":{"id":"digi-id","keyv":1,"pref":1}}`),
+		},
+		Regs: &openrtb.Regs{
+			COPPA: 1,
+			Ext:   json.RawMessage(`{"gdpr":1}`),
 		},
 		Imp: []openrtb.Imp{{
 			ID: "some-imp-id",
@@ -111,7 +468,34 @@ func newRaceCheckingRequest(t *testing.T) *openrtb.BidRequest {
 	}
 }
 
-func buildImpExt(t *testing.T, jsonFilename string) openrtb.RawJSON {
+func TestPanicRecovery(t *testing.T) {
+	cfg := &config.Configuration{
+		CacheURL: config.Cache{
+			ExpectedTimeMillis: 20,
+		},
+		Adapters: blankAdapterConfig(openrtb_ext.BidderList()),
+	}
+
+	theMetrics := pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList(), config.DisabledMetrics{})
+	e := NewExchange(&http.Client{}, nil, cfg, theMetrics, adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault()).(*exchange)
+	chBids := make(chan *bidResponseWrapper, 1)
+	panicker := func(aName openrtb_ext.BidderName, coreBidder openrtb_ext.BidderName, request *openrtb.BidRequest, bidlabels *pbsmetrics.AdapterLabels, conversions currencies.Conversions) {
+		panic("panic!")
+	}
+	recovered := e.recoverSafely(panicker, chBids)
+	apnLabels := pbsmetrics.AdapterLabels{
+		Source:      pbsmetrics.DemandWeb,
+		RType:       pbsmetrics.ReqTypeORTB2Web,
+		Adapter:     openrtb_ext.BidderAppnexus,
+		PubID:       "test1",
+		Browser:     pbsmetrics.BrowserSafari,
+		CookieFlag:  pbsmetrics.CookieFlagYes,
+		AdapterBids: pbsmetrics.AdapterBidNone,
+	}
+	recovered(openrtb_ext.BidderAppnexus, openrtb_ext.BidderAppnexus, nil, &apnLabels, nil)
+}
+
+func buildImpExt(t *testing.T, jsonFilename string) json.RawMessage {
 	adapterFolders, err := ioutil.ReadDir("../adapters")
 	if err != nil {
 		t.Fatalf("Failed to open adapters directory: %v", err)
@@ -132,309 +516,66 @@ func buildImpExt(t *testing.T, jsonFilename string) openrtb.RawJSON {
 	if err != nil {
 		t.Fatalf("Failed to marshal JSON: %v", err)
 	}
-	return openrtb.RawJSON(toReturn)
+	return json.RawMessage(toReturn)
 }
 
-func TestHoldAuction(t *testing.T) {
-	respStatus := 200
-	respBody := "{\"bid\":false}"
-	server := httptest.NewServer(mockHandler(respStatus, "getBody", respBody))
+func TestPanicRecoveryHighLevel(t *testing.T) {
+	noBidServer := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(204)
+	}
+	server := httptest.NewServer(http.HandlerFunc(noBidServer))
 	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
 
-	e := NewDummyExchange(server.Client())
-	mockAdapterConfig1(e.adapterMap[BidderDummy].(*mockAdapter), "dummy")
-	mockAdapterConfig2(e.adapterMap[BidderDummy2].(*mockAdapter), "dummy2")
-	mockAdapterConfig3(e.adapterMap[BidderDummy3].(*mockAdapter), "dummy3")
-
-	// Very simple Bid request. The dummy bidders know what to do.
-	bidRequest := new(openrtb.BidRequest)
-	bidRequest.ID = "This Bid"
-	bidRequest.Imp = make([]openrtb.Imp, 2)
-
-	// Need extensions for all the bidders so we know to hold auctions for them.
-	impExt := make(map[string]map[string]string)
-	impExt["dummy"] = make(map[string]string)
-	impExt["dummy2"] = make(map[string]string)
-	impExt["dummy3"] = make(map[string]string)
-	b, _ := json.Marshal(impExt)
-	bidRequest.Imp[0].Ext = b
-	bidRequest.Imp[1].Ext = b
-
-	bidResponse, err := e.HoldAuction(ctx, bidRequest, &emptyUsersync{}, pbsmetrics.Labels{})
-	if err != nil {
-		t.Errorf("HoldAuction: %s", err.Error())
+	cfg := &config.Configuration{
+		Adapters: make(map[string]config.Adapter, len(openrtb_ext.BidderMap)),
 	}
-	bidResponseExt := new(openrtb_ext.ExtBidResponse)
-	_ = json.Unmarshal(bidResponse.Ext, bidResponseExt)
-
-	if len(bidResponseExt.ResponseTimeMillis) != 3 {
-		t.Errorf("HoldAuction: Did not find 3 response times. Found %d instead", len(bidResponseExt.ResponseTimeMillis))
-	}
-	if len(bidResponse.SeatBid) != 3 {
-		t.Errorf("HoldAuction: Expected 3 SeatBids, found %d instead", len(bidResponse.SeatBid))
-	}
-	if bidResponse.NBR != nil {
-		t.Errorf("HoldAuction: Found invalid auction flag in response: %d", *bidResponse.NBR)
-	}
-	// Find the indexes of the bidders, as they should be scrambled
-	// Set initial value to -1 so we error out if bidders are not found.
-	var (
-		dummy1 = -1
-		dummy3 = -1
-	)
-	for i, sb := range bidResponse.SeatBid {
-		if sb.Seat == "dummy" {
-			dummy1 = i
-		}
-		if sb.Seat == "dummy3" {
-			dummy3 = i
+	for _, bidder := range openrtb_ext.BidderList() {
+		cfg.Adapters[strings.ToLower(string(bidder))] = config.Adapter{
+			Endpoint: server.URL,
 		}
 	}
-	if len(bidResponse.SeatBid[dummy1].Bid) != 2 {
-		t.Errorf("HoldAuction: Expected 2 bids from dummy bidder, found %d instead", len(bidResponse.SeatBid[dummy1].Bid))
-	}
-	if len(bidResponse.SeatBid[dummy3].Bid) != 1 {
-		t.Errorf("HoldAuction: Expected 2 bids from dummy bidder, found %d instead", len(bidResponse.SeatBid[dummy1].Bid))
-	}
+	e := NewExchange(server.Client(), &mockCache{}, cfg, pbsmetrics.NewMetrics(metrics.NewRegistry(), openrtb_ext.BidderList(), config.DisabledMetrics{}), adapters.ParseBidderInfos(cfg.Adapters, "../static/bidder-info", openrtb_ext.BidderList()), gdpr.AlwaysAllow{}, currencies.NewRateConverterDefault()).(*exchange)
 
-}
+	e.adapterMap[openrtb_ext.BidderBeachfront] = panicingAdapter{}
+	e.adapterMap[openrtb_ext.BidderAppnexus] = panicingAdapter{}
 
-func TestGetAllBids(t *testing.T) {
-	respStatus := 200
-	respBody := "{\"bid\":false}"
-	server := httptest.NewServer(mockHandler(respStatus, "getBody", respBody))
-	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	e := NewDummyExchange(server.Client())
-	mockAdapterConfig1(e.adapterMap[BidderDummy].(*mockAdapter), "dummy")
-	mockAdapterConfig2(e.adapterMap[BidderDummy2].(*mockAdapter), "dummy2")
-	mockAdapterConfig3(e.adapterMap[BidderDummy3].(*mockAdapter), "dummy3")
-
-	cleanRequests := map[openrtb_ext.BidderName]*openrtb.BidRequest{
-		BidderDummy:  nil,
-		BidderDummy2: nil,
-		BidderDummy3: nil,
-	}
-	blabels := make(map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels)
-	blabels[openrtb_ext.BidderName("dummy")] = &pbsmetrics.AdapterLabels{}
-	blabels[openrtb_ext.BidderName("dummy2")] = &pbsmetrics.AdapterLabels{}
-	blabels[openrtb_ext.BidderName("dummy3")] = &pbsmetrics.AdapterLabels{}
-	adapterBids, adapterExtra := e.getAllBids(ctx, cleanRequests, nil, blabels)
-	if len(adapterBids[BidderDummy].bids) != 2 {
-		t.Errorf("GetAllBids failed to get 2 bids from BidderDummy, found %d instead", len(adapterBids[BidderDummy].bids))
-	}
-	if adapterBids[BidderDummy].bids[0].bid.ID != "1234567890" {
-		t.Errorf("GetAllBids failed to get the first bid of BidderDummy")
-	}
-	if adapterBids[BidderDummy3].bids[0].bid.ID != "MyBid" {
-		t.Errorf("GetAllBids failed to get the bid from BidderDummy3")
-	}
-	if len(adapterExtra) != 3 {
-		t.Errorf("GetAllBids failed to return 3 adapterExtra's, got %d instead", len(adapterExtra))
-	}
-
-	// Now test with an error condition
-	mockAdapterConfigErr1(e.adapterMap[BidderDummy2].(*mockAdapter))
-	if len(e.adapterMap[BidderDummy2].(*mockAdapter).errs) != 2 {
-		t.Errorf("GetAllBids, Bidder2 adapter error generation failed. Only seeing %d errors", len(e.adapterMap[BidderDummy2].(*mockAdapter).errs))
-	}
-	adapterBids, adapterExtra = e.getAllBids(ctx, cleanRequests, nil, blabels)
-
-	if len(e.adapterMap[BidderDummy2].(*mockAdapter).errs) != 2 {
-		t.Errorf("GetAllBids, Bidder2 adapter error generation failed. Only seeing %d errors", len(e.adapterMap[BidderDummy2].(*mockAdapter).errs))
-	}
-	if len(adapterExtra[BidderDummy2].Errors) != 2 {
-		t.Errorf("GetAllBids failed to report 2 errors on Bidder2, found %d errors", len(adapterExtra[BidderDummy2].Errors))
-	}
-	if len(adapterExtra[BidderDummy].Errors) != 0 {
-		t.Errorf("GetAllBids found errors on Bidder1, found %d errors", len(adapterExtra[BidderDummy2].Errors))
-	}
-	if len(adapterBids[BidderDummy2].bids) != 0 {
-		t.Errorf("GetAllBids found bids on Bidder2, found %d bids", len(adapterBids[BidderDummy2].bids))
-	}
-
-	// Test with null pointer for bid response
-	mockAdapterConfigErr2(e.adapterMap[BidderDummy2].(*mockAdapter))
-	adapterBids, adapterExtra = e.getAllBids(ctx, cleanRequests, nil, blabels)
-
-	if len(adapterExtra[BidderDummy2].Errors) != 1 {
-		t.Errorf("GetAllBids failed to report 1 errors on Bidder2, found %d errors", len(adapterExtra[BidderDummy2].Errors))
-	}
-	if len(adapterExtra[BidderDummy].Errors) != 0 {
-		t.Errorf("GetAllBids found errors on Bidder1, found %d errors", len(adapterExtra[BidderDummy2].Errors))
-	}
-}
-
-func TestBuildBidResponse(t *testing.T) {
-	//  BuildBidResponse(liveAdapters []openrtb_ext.BidderName, adapterBids map[openrtb_ext.BidderName]*adapters.pbsOrtbSeatBid, bidRequest *openrtb.BidRequest, adapterExtra map[openrtb_ext.BidderName]*seatResponseExtra) *openrtb.BidResponse
-	respStatus := 200
-	respBody := "{\"bid\":false}"
-	server := httptest.NewServer(mockHandler(respStatus, "getBody", respBody))
-	defer server.Close()
-
-	e := NewDummyExchange(server.Client())
-	mockAdapterConfig1(e.adapterMap[BidderDummy].(*mockAdapter), "dummy")
-	mockAdapterConfig2(e.adapterMap[BidderDummy2].(*mockAdapter), "dummy2")
-	mockAdapterConfig3(e.adapterMap[BidderDummy3].(*mockAdapter), "dummy3")
-
-	// Very simple Bid request. At this point we are just reading these two values
-	// Adding targeting to enable targeting tests
-	bidReqExt := openrtb_ext.ExtRequest{
-		Prebid: openrtb_ext.ExtRequestPrebid{
-			Targeting: &openrtb_ext.ExtRequestTargeting{
-				PriceGranularity: openrtb_ext.PriceGranularityMedium,
+	request := &openrtb.BidRequest{
+		Site: &openrtb.Site{
+			Page:   "www.some.domain.com",
+			Domain: "domain.com",
+			Publisher: &openrtb.Publisher{
+				ID: "some-publisher-id",
 			},
 		},
-	}
-	var bidReqExtRaw openrtb.RawJSON
-	bidReqExtRaw, err := json.Marshal(bidReqExt)
-	bidRequest := openrtb.BidRequest{
-		ID:   "This Bid",
-		Test: 0,
-		Ext:  bidReqExtRaw,
-	}
-	var resolvedRequest json.RawMessage
-
-	liveAdapters := make([]openrtb_ext.BidderName, 3)
-	liveAdapters[0] = BidderDummy
-	liveAdapters[1] = BidderDummy2
-	liveAdapters[2] = BidderDummy3
-
-	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
-	adapterExtra := make(map[openrtb_ext.BidderName]*seatResponseExtra)
-
-	var errs1, errs2, errs3 []error
-	adapterBids[BidderDummy], errs1 = mockDummyBids1("dummy")
-	adapterBids[BidderDummy2], errs2 = mockDummyBids2("dummy2")
-	adapterBids[BidderDummy3], errs3 = mockDummyBids3("dummy3")
-	adapterExtra[BidderDummy] = &seatResponseExtra{ResponseTimeMillis: 131, Errors: convertErr2Str(errs1)}
-	adapterExtra[BidderDummy2] = &seatResponseExtra{ResponseTimeMillis: 97, Errors: convertErr2Str(errs2)}
-	adapterExtra[BidderDummy3] = &seatResponseExtra{ResponseTimeMillis: 141, Errors: convertErr2Str(errs3)}
-
-	errList := make([]error, 0, 1)
-	bidResponse, err := e.buildBidResponse(context.Background(), liveAdapters, adapterBids, &bidRequest, resolvedRequest, adapterExtra, errList)
-	if err != nil {
-		t.Errorf("BuildBidResponse: %s", err.Error())
-	}
-	bidResponseExt := new(openrtb_ext.ExtBidResponse)
-	_ = json.Unmarshal(bidResponse.Ext, bidResponseExt)
-
-	if len(bidResponseExt.ResponseTimeMillis) != 3 {
-		t.Errorf("BuildBidResponse: Did not find 3 response times. Found %d instead", len(bidResponseExt.ResponseTimeMillis))
-	}
-	if len(bidResponse.SeatBid) != 3 {
-		t.Errorf("BuildBidResponse: Expected 3 SeatBids, found %d instead", len(bidResponse.SeatBid))
-	}
-	if len(bidResponse.SeatBid) != 3 {
-		t.Errorf("BuildBidResponse: Expected 3 SeatBids, found %d instead", len(bidResponse.SeatBid))
-	}
-	// Find the seat index for BidderDummy
-	bidderDummySeat := -1
-	for i, seat := range bidResponse.SeatBid {
-		if seat.Seat == "dummy" {
-			bidderDummySeat = i
-		}
-	}
-	if bidderDummySeat == -1 {
-		t.Error("Could not find the SeatBid for BidderDummy!")
-	} else {
-		bidder1BidExt := make([]openrtb_ext.ExtBid, 2)
-		err = json.Unmarshal(bidResponse.SeatBid[bidderDummySeat].Bid[0].Ext, &bidder1BidExt[0])
-		if err != nil {
-			t.Errorf("Unpacking extensions for bid[0]: %s", err.Error())
-		}
-		err = json.Unmarshal(bidResponse.SeatBid[bidderDummySeat].Bid[1].Ext, &bidder1BidExt[1])
-		if err != nil {
-			t.Errorf("Unpacking extensions for bid[1]: %s", err.Error())
-		}
-		// All tests except for winning bid no longer valid as setting pre bid targeting values moved to exchange/bidder.go
-		assertStringValue(t, "bid[0].Targeting[hb_pb_dummy]", "1.30", bidder1BidExt[0].Prebid.Targeting["hb_pb_dummy"])
-		assertStringValue(t, "bid[0]Targeting[hb_bidder_dummy]", "dummy", bidder1BidExt[0].Prebid.Targeting["hb_bidder_dummy"])
-		assertStringValue(t, "bid[0]Targeting[hb_size_dummy]", "728x90", bidder1BidExt[0].Prebid.Targeting["hb_size_dummy"])
-		assertStringValue(t, "bid[1].Targeting[hb_pb_dummy]", "0.70", bidder1BidExt[1].Prebid.Targeting["hb_pb_dummy"])
-		assertStringValue(t, "bid[1]Targeting[hb_bidder_dummy]", "dummy", bidder1BidExt[1].Prebid.Targeting["hb_bidder_dummy"])
-		assertStringValue(t, "bid[1]Targeting[hb_size_dummy]", "300x250", bidder1BidExt[1].Prebid.Targeting["hb_size_dummy"])
-		_, ok := bidder1BidExt[1].Prebid.Targeting["hb_pb"]
-		if ok {
-			t.Errorf("bid[1].Targeting[hb_pb] exists, but wasn't winning bid. Got \"%s\"", bidder1BidExt[1].Prebid.Targeting["hb_pb"])
-		}
-
-	}
-	// Now test with an error condition
-	adapterBids[BidderDummy2], errs2 = mockDummyBidsErr1()
-	adapterExtra[BidderDummy2] = &seatResponseExtra{ResponseTimeMillis: 97, Errors: convertErr2Str(errs2)}
-
-	bidResponse, err = e.buildBidResponse(context.Background(), liveAdapters, adapterBids, &bidRequest, resolvedRequest, adapterExtra, errList)
-	if err != nil {
-		t.Errorf("BuildBidResponse: %s", err.Error())
-	}
-	bidResponseExt = new(openrtb_ext.ExtBidResponse)
-	_ = json.Unmarshal(bidResponse.Ext, bidResponseExt)
-
-	// This case we know the order of the adapters, as GetAllBids have not scrambled them
-	if len(bidResponse.SeatBid[0].Bid) != 2 {
-		t.Errorf("BuildBidResponse: Bidder 1 expected 2 bids, found %d", len(bidResponse.SeatBid[0].Bid))
-	}
-	if bidResponse.SeatBid[1].Bid[0].ID != "MyBid" {
-		t.Errorf("BuildBidResponse: Bidder 3 bid ID not correct. Expected \"MyBid\", found \"%s\"", bidResponse.SeatBid[2].Bid[0].ID)
-	}
-
-	// Test with null bid response error
-	adapterBids[BidderDummy2], errs2 = mockDummyBidsErr2()
-	adapterExtra[BidderDummy2] = &seatResponseExtra{ResponseTimeMillis: 97, Errors: convertErr2Str(errs2)}
-
-	bidResponse, err = e.buildBidResponse(context.Background(), liveAdapters, adapterBids, &bidRequest, resolvedRequest, adapterExtra, errList)
-	if err != nil {
-		t.Errorf("BuildBidResponse: %s", err.Error())
-	}
-	bidResponseExt = new(openrtb_ext.ExtBidResponse)
-	_ = json.Unmarshal(bidResponse.Ext, bidResponseExt)
-
-	// This case we know the order of the adapters, as GetAllBids have not scrambled them
-	if len(bidResponse.SeatBid[0].Bid) != 2 {
-		t.Errorf("BuildBidResponse: Bidder 1 expected 2 bids, found %d", len(bidResponse.SeatBid[0].Bid))
-	}
-	if bidResponse.SeatBid[1].Bid[0].ID != "MyBid" {
-		t.Errorf("BuildBidResponse: Bidder 3 bid ID not correct. Expected \"MyBid\", found \"%s\"", bidResponse.SeatBid[2].Bid[0].ID)
-	}
-}
-
-var baseRequest = openrtb.BidRequest{
-	ID: "foo",
-	Imp: []openrtb.Imp{{
-		Video: &openrtb.Video{
-			MIMEs: []string{"video/mp4"},
+		User: &openrtb.User{
+			ID:       "our-id",
+			BuyerUID: "their-id",
+			Ext:      json.RawMessage(`{"consent":"BONciguONcjGKADACHENAOLS1rAHDAFAAEAASABQAMwAeACEAFw","digitrust":{"id":"digi-id","keyv":1,"pref":1}}`),
 		},
-	}},
-	App: &openrtb.App{},
-}
-
-func TestBuyerIdWithoutUser(t *testing.T) {
-	req := baseRequest
-	runBuyerTest(t, &req, true)
-}
-
-func TestBuyerIdWithUser(t *testing.T) {
-	req := baseRequest
-	req.User = &openrtb.User{
-		ID: "abc",
+		Imp: []openrtb.Imp{{
+			ID: "some-imp-id",
+			Banner: &openrtb.Banner{
+				Format: []openrtb.Format{{
+					W: 300,
+					H: 250,
+				}, {
+					W: 300,
+					H: 600,
+				}},
+			},
+			Ext: buildImpExt(t, "banner"),
+		}},
 	}
 
-	runBuyerTest(t, &req, true)
-}
-
-func TestBuyerIdWithExplicit(t *testing.T) {
-	req := baseRequest
-	req.User = &openrtb.User{
-		ID:       "abc",
-		BuyerUID: "def",
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+	_, err := e.HoldAuction(context.Background(), request, &emptyUsersync{}, pbsmetrics.Labels{}, &categoriesFetcher)
+	if err != nil {
+		t.Errorf("HoldAuction returned unexpected error: %v", err)
 	}
 
-	runBuyerTest(t, &req, false)
 }
 
 func TestTimeoutComputation(t *testing.T) {
@@ -454,109 +595,688 @@ func TestTimeoutComputation(t *testing.T) {
 	}
 }
 
-func runBuyerTest(t *testing.T, incoming *openrtb.BidRequest, expectBuyeridOverride bool) {
-	t.Helper()
+// TestExchangeJSON executes tests for all the *.json files in exchangetest.
+func TestExchangeJSON(t *testing.T) {
+	if specFiles, err := ioutil.ReadDir("./exchangetest"); err == nil {
+		for _, specFile := range specFiles {
+			fileName := "./exchangetest/" + specFile.Name()
+			fileDisplayName := "exchange/exchangetest/" + specFile.Name()
+			specData, err := loadFile(fileName)
+			if err != nil {
+				t.Fatalf("Failed to load contents of file %s: %v", fileDisplayName, err)
+			}
 
-	initialId := ""
-	if incoming.User != nil {
-		initialId = incoming.User.BuyerUID
+			runSpec(t, fileDisplayName, specData)
+		}
+	}
+}
+
+// LoadFile reads and parses a file as a test case. If something goes wrong, it returns an error.
+func loadFile(filename string) (*exchangeSpec, error) {
+	specData, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read file %s: %v", filename, err)
 	}
 
-	overrideId := "apnId"
+	var spec exchangeSpec
+	if err := json.Unmarshal(specData, &spec); err != nil {
+		return nil, fmt.Errorf("Failed to unmarshal JSON from file: %v", err)
+	}
 
-	incoming.Imp[0].Ext = []byte(`{"appnexus": {}}`)
-	syncs := &mockSyncs{
-		uids: map[openrtb_ext.BidderName]string{
-			openrtb_ext.BidderAppnexus: overrideId,
+	return &spec, nil
+}
+
+func runSpec(t *testing.T, filename string, spec *exchangeSpec) {
+	aliases, errs := parseAliases(&spec.IncomingRequest.OrtbRequest)
+	if len(errs) != 0 {
+		t.Fatalf("%s: Failed to parse aliases", filename)
+	}
+	ex := newExchangeForTests(t, filename, spec.OutgoingRequests, aliases, spec.EnforceCCPA)
+	biddersInAuction := findBiddersInAuction(t, filename, &spec.IncomingRequest.OrtbRequest)
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+	bid, err := ex.HoldAuction(context.Background(), &spec.IncomingRequest.OrtbRequest, mockIdFetcher(spec.IncomingRequest.Usersyncs), pbsmetrics.Labels{}, &categoriesFetcher)
+	responseTimes := extractResponseTimes(t, filename, bid)
+	for _, bidderName := range biddersInAuction {
+		if _, ok := responseTimes[bidderName]; !ok {
+			t.Errorf("%s: Response JSON missing expected ext.responsetimemillis.%s", filename, bidderName)
+		}
+	}
+	if spec.Response.Bids != nil {
+		diffOrtbResponses(t, filename, spec.Response.Bids, bid)
+		if err == nil {
+			if spec.Response.Error != "" {
+				t.Errorf("%s: Exchange did not return expected error: %s", filename, spec.Response.Error)
+			}
+		} else {
+			if err.Error() != spec.Response.Error {
+				t.Errorf("%s: Exchange returned different errors. Expected %s, got %s", filename, spec.Response.Error, err.Error())
+			}
+		}
+	}
+}
+
+func findBiddersInAuction(t *testing.T, context string, req *openrtb.BidRequest) []string {
+	if splitImps, err := splitImps(req.Imp); err != nil {
+		t.Errorf("%s: Failed to parse Bidders from request: %v", context, err)
+		return nil
+	} else {
+		bidders := make([]string, 0, len(splitImps))
+		for bidderName := range splitImps {
+			bidders = append(bidders, bidderName)
+		}
+		return bidders
+	}
+}
+
+// extractResponseTimes validates the format of bid.ext.responsetimemillis, and then removes it.
+// This is done because the response time will change from run to run, so it's impossible to hardcode a value
+// into the JSON. The best we can do is make sure that the property exists.
+func extractResponseTimes(t *testing.T, context string, bid *openrtb.BidResponse) map[string]int {
+	if data, dataType, _, err := jsonparser.Get(bid.Ext, "responsetimemillis"); err != nil || dataType != jsonparser.Object {
+		t.Errorf("%s: Exchange did not return ext.responsetimemillis object: %v", context, err)
+		return nil
+	} else {
+		responseTimes := make(map[string]int)
+		if err := json.Unmarshal(data, &responseTimes); err != nil {
+			t.Errorf("%s: Failed to unmarshal ext.responsetimemillis into map[string]int: %v", context, err)
+			return nil
+		}
+
+		// Delete the response times so that they don't appear in the JSON, because they can't be tested reliably anyway.
+		// If there's no other ext, just delete it altogether.
+		bid.Ext = jsonparser.Delete(bid.Ext, "responsetimemillis")
+		if diff, err := gojsondiff.New().Compare(bid.Ext, []byte("{}")); err == nil && !diff.Modified() {
+			bid.Ext = nil
+		}
+		return responseTimes
+	}
+}
+
+func newExchangeForTests(t *testing.T, filename string, expectations map[string]*bidderSpec, aliases map[string]string, enforceCCPA bool) Exchange {
+	adapters := make(map[openrtb_ext.BidderName]adaptedBidder)
+	for _, bidderName := range openrtb_ext.BidderMap {
+		if spec, ok := expectations[string(bidderName)]; ok {
+			adapters[bidderName] = &validatingBidder{
+				t:             t,
+				fileName:      filename,
+				bidderName:    string(bidderName),
+				expectations:  map[string]*bidderRequest{string(bidderName): spec.ExpectedRequest},
+				mockResponses: map[string]bidderResponse{string(bidderName): spec.MockResponse},
+			}
+		}
+	}
+	for alias, coreBidder := range aliases {
+		if spec, ok := expectations[alias]; ok {
+			if bidder, ok := adapters[openrtb_ext.BidderName(coreBidder)]; ok {
+				bidder.(*validatingBidder).expectations[alias] = spec.ExpectedRequest
+				bidder.(*validatingBidder).mockResponses[alias] = spec.MockResponse
+			} else {
+				adapters[openrtb_ext.BidderName(coreBidder)] = &validatingBidder{
+					t:             t,
+					fileName:      filename,
+					bidderName:    coreBidder,
+					expectations:  map[string]*bidderRequest{coreBidder: spec.ExpectedRequest},
+					mockResponses: map[string]bidderResponse{coreBidder: spec.MockResponse},
+				}
+			}
+		}
+	}
+
+	return &exchange{
+		adapterMap:          adapters,
+		me:                  metricsConf.NewMetricsEngine(&config.Configuration{}, openrtb_ext.BidderList()),
+		cache:               &wellBehavedCache{},
+		cacheTime:           0,
+		gDPR:                gdpr.AlwaysAllow{},
+		currencyConverter:   currencies.NewRateConverterDefault(),
+		UsersyncIfAmbiguous: false,
+		enforceCCPA:         enforceCCPA,
+	}
+}
+
+func newExtRequest() openrtb_ext.ExtRequest {
+	priceGran := openrtb_ext.PriceGranularity{
+		Precision: 2,
+		Ranges: []openrtb_ext.GranularityRange{
+			{
+				Min:       0.0,
+				Max:       20.0,
+				Increment: 2.0,
+			},
 		},
 	}
 
-	bidder := &mockBidder{}
+	translateCategories := true
+	brandCat := openrtb_ext.ExtIncludeBrandCategory{PrimaryAdServer: 1, WithCategory: true, TranslateCategories: &translateCategories}
 
-	ex := &exchange{
-		adapterMap: map[openrtb_ext.BidderName]adaptedBidder{
-			openrtb_ext.BidderAppnexus: bidder,
+	reqExt := openrtb_ext.ExtRequestTargeting{
+		PriceGranularity:     priceGran,
+		IncludeWinners:       true,
+		IncludeBrandCategory: &brandCat,
+	}
+
+	return openrtb_ext.ExtRequest{
+		Prebid: openrtb_ext.ExtRequestPrebid{
+			Targeting: &reqExt,
 		},
-		me: &pbsmetrics.DummyMetricsEngine{},
-	}
-	ex.HoldAuction(context.Background(), incoming, syncs, pbsmetrics.Labels{})
-
-	if bidder.lastRequest == nil {
-		t.Fatalf("The Bidder never received a request.")
-	}
-
-	if bidder.lastRequest.User == nil {
-		t.Fatalf("bidrequest.user was not defined on the Bidder's request.")
-	}
-
-	if (expectBuyeridOverride && bidder.lastRequest.User.BuyerUID != overrideId) || (!expectBuyeridOverride && bidder.lastRequest.User.BuyerUID != initialId) {
-		t.Errorf("Bidder received bad bidrequest.user.buyeruid. Expected %s, got %s", initialId, bidder.lastRequest.User.BuyerUID)
 	}
 }
 
-type mockBidder struct {
-	lastRequest *openrtb.BidRequest
+func newExtRequestNoBrandCat() openrtb_ext.ExtRequest {
+	priceGran := openrtb_ext.PriceGranularity{
+		Precision: 2,
+		Ranges: []openrtb_ext.GranularityRange{
+			{
+				Min:       0.0,
+				Max:       20.0,
+				Increment: 2.0,
+			},
+		},
+	}
+
+	brandCat := openrtb_ext.ExtIncludeBrandCategory{WithCategory: false}
+
+	reqExt := openrtb_ext.ExtRequestTargeting{
+		PriceGranularity:     priceGran,
+		IncludeWinners:       true,
+		IncludeBrandCategory: &brandCat,
+	}
+
+	return openrtb_ext.ExtRequest{
+		Prebid: openrtb_ext.ExtRequestPrebid{
+			Targeting: &reqExt,
+		},
+	}
 }
 
-func (b *mockBidder) requestBid(ctx context.Context, request *openrtb.BidRequest, name openrtb_ext.BidderName) (*pbsOrtbSeatBid, []error) {
-	b.lastRequest = request
-	return nil, nil
+func TestCategoryMapping(t *testing.T) {
+
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+
+	requestExt := newExtRequest()
+
+	targData := &targetData{
+		priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
+		includeWinners:   true,
+	}
+
+	requestExt.Prebid.Targeting.DurationRangeSec = []int{15, 30, 50}
+
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
+
+	cats1 := []string{"IAB1-3"}
+	cats2 := []string{"IAB1-4"}
+	cats3 := []string{"IAB1-1000"}
+	cats4 := []string{"IAB1-2000"}
+	bid1 := openrtb.Bid{ID: "bid_id1", ImpID: "imp_id1", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid2 := openrtb.Bid{ID: "bid_id2", ImpID: "imp_id2", Price: 20.0000, Cat: cats2, W: 1, H: 1}
+	bid3 := openrtb.Bid{ID: "bid_id3", ImpID: "imp_id3", Price: 30.0000, Cat: cats3, W: 1, H: 1}
+	bid4 := openrtb.Bid{ID: "bid_id4", ImpID: "imp_id4", Price: 40.0000, Cat: cats4, W: 1, H: 1}
+
+	bid1_1 := pbsOrtbBid{&bid1, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_2 := pbsOrtbBid{&bid2, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 40}}
+	bid1_3 := pbsOrtbBid{&bid3, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30, PrimaryCategory: "AdapterOverride"}}
+	bid1_4 := pbsOrtbBid{&bid4, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+
+	innerBids := []*pbsOrtbBid{
+		&bid1_1,
+		&bid1_2,
+		&bid1_3,
+		&bid1_4,
+	}
+
+	seatBid := pbsOrtbSeatBid{innerBids, "USD", nil, nil}
+	bidderName1 := openrtb_ext.BidderName("appnexus")
+
+	adapterBids[bidderName1] = &seatBid
+
+	bidCategory, adapterBids, err := applyCategoryMapping(nil, requestExt, adapterBids, categoriesFetcher, targData)
+
+	assert.Equal(t, nil, err, "Category mapping error should be empty")
+	assert.Equal(t, "10.00_Electronics_30s", bidCategory["bid_id1"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_Sports_50s", bidCategory["bid_id2"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_AdapterOverride_30s", bidCategory["bid_id3"], "Category mapping override from adapter didn't take")
+	assert.Equal(t, 3, len(adapterBids[bidderName1].bids), "Bidders number doesn't match")
+	assert.Equal(t, 3, len(bidCategory), "Bidders category mapping doesn't match")
 }
 
-type mockSyncs struct {
-	uids map[openrtb_ext.BidderName]string
+func TestCategoryMappingNoIncludeBrandCategory(t *testing.T) {
+
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+
+	requestExt := newExtRequestNoBrandCat()
+
+	targData := &targetData{
+		priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
+		includeWinners:   true,
+	}
+	requestExt.Prebid.Targeting.DurationRangeSec = []int{15, 30, 40, 50}
+
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
+
+	cats1 := []string{"IAB1-3"}
+	cats2 := []string{"IAB1-4"}
+	cats3 := []string{"IAB1-1000"}
+	cats4 := []string{"IAB1-2000"}
+	bid1 := openrtb.Bid{ID: "bid_id1", ImpID: "imp_id1", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid2 := openrtb.Bid{ID: "bid_id2", ImpID: "imp_id2", Price: 20.0000, Cat: cats2, W: 1, H: 1}
+	bid3 := openrtb.Bid{ID: "bid_id3", ImpID: "imp_id3", Price: 30.0000, Cat: cats3, W: 1, H: 1}
+	bid4 := openrtb.Bid{ID: "bid_id4", ImpID: "imp_id4", Price: 40.0000, Cat: cats4, W: 1, H: 1}
+
+	bid1_1 := pbsOrtbBid{&bid1, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_2 := pbsOrtbBid{&bid2, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 40}}
+	bid1_3 := pbsOrtbBid{&bid3, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30, PrimaryCategory: "AdapterOverride"}}
+	bid1_4 := pbsOrtbBid{&bid4, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 50}}
+
+	innerBids := []*pbsOrtbBid{
+		&bid1_1,
+		&bid1_2,
+		&bid1_3,
+		&bid1_4,
+	}
+
+	seatBid := pbsOrtbSeatBid{innerBids, "USD", nil, nil}
+	bidderName1 := openrtb_ext.BidderName("appnexus")
+
+	adapterBids[bidderName1] = &seatBid
+
+	bidCategory, adapterBids, err := applyCategoryMapping(nil, requestExt, adapterBids, categoriesFetcher, targData)
+
+	assert.Equal(t, nil, err, "Category mapping error should be empty")
+	assert.Equal(t, "10.00_30s", bidCategory["bid_id1"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_40s", bidCategory["bid_id2"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_30s", bidCategory["bid_id3"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_50s", bidCategory["bid_id4"], "Category mapping doesn't match")
+	assert.Equal(t, 4, len(adapterBids[bidderName1].bids), "Bidders number doesn't match")
+	assert.Equal(t, 4, len(bidCategory), "Bidders category mapping doesn't match")
 }
 
-func (m *mockSyncs) GetId(name openrtb_ext.BidderName) (id string, ok bool) {
-	id, ok = m.uids[name]
+func TestCategoryMappingTranslateCategoriesNil(t *testing.T) {
+
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+
+	requestExt := newExtRequestTranslateCategories(nil)
+
+	targData := &targetData{
+		priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
+		includeWinners:   true,
+	}
+
+	requestExt.Prebid.Targeting.DurationRangeSec = []int{15, 30, 50}
+
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
+
+	cats1 := []string{"IAB1-3"}
+	cats2 := []string{"IAB1-4"}
+	cats3 := []string{"IAB1-1000"}
+	bid1 := openrtb.Bid{ID: "bid_id1", ImpID: "imp_id1", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid2 := openrtb.Bid{ID: "bid_id2", ImpID: "imp_id2", Price: 20.0000, Cat: cats2, W: 1, H: 1}
+	bid3 := openrtb.Bid{ID: "bid_id3", ImpID: "imp_id3", Price: 30.0000, Cat: cats3, W: 1, H: 1}
+
+	bid1_1 := pbsOrtbBid{&bid1, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_2 := pbsOrtbBid{&bid2, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 40}}
+	bid1_3 := pbsOrtbBid{&bid3, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+
+	innerBids := []*pbsOrtbBid{
+		&bid1_1,
+		&bid1_2,
+		&bid1_3,
+	}
+
+	seatBid := pbsOrtbSeatBid{innerBids, "USD", nil, nil}
+	bidderName1 := openrtb_ext.BidderName("appnexus")
+
+	adapterBids[bidderName1] = &seatBid
+
+	bidCategory, adapterBids, err := applyCategoryMapping(nil, requestExt, adapterBids, categoriesFetcher, targData)
+
+	assert.Equal(t, nil, err, "Category mapping error should be empty")
+	assert.Equal(t, "10.00_Electronics_30s", bidCategory["bid_id1"], "Category mapping doesn't match")
+	assert.Equal(t, "20.00_Sports_50s", bidCategory["bid_id2"], "Category mapping doesn't match")
+	assert.Equal(t, 2, len(adapterBids[bidderName1].bids), "Bidders number doesn't match")
+	assert.Equal(t, 2, len(bidCategory), "Bidders category mapping doesn't match")
+}
+
+func newExtRequestTranslateCategories(translateCategories *bool) openrtb_ext.ExtRequest {
+	priceGran := openrtb_ext.PriceGranularity{
+		Precision: 2,
+		Ranges: []openrtb_ext.GranularityRange{
+			{
+				Min:       0.0,
+				Max:       20.0,
+				Increment: 2.0,
+			},
+		},
+	}
+
+	brandCat := openrtb_ext.ExtIncludeBrandCategory{WithCategory: true, PrimaryAdServer: 1}
+	if translateCategories != nil {
+		brandCat.TranslateCategories = translateCategories
+	}
+
+	reqExt := openrtb_ext.ExtRequestTargeting{
+		PriceGranularity:     priceGran,
+		IncludeWinners:       true,
+		IncludeBrandCategory: &brandCat,
+	}
+
+	return openrtb_ext.ExtRequest{
+		Prebid: openrtb_ext.ExtRequestPrebid{
+			Targeting: &reqExt,
+		},
+	}
+}
+
+func TestCategoryMappingTranslateCategoriesFalse(t *testing.T) {
+
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+
+	translateCategories := false
+	requestExt := newExtRequestTranslateCategories(&translateCategories)
+
+	targData := &targetData{
+		priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
+		includeWinners:   true,
+	}
+
+	requestExt.Prebid.Targeting.DurationRangeSec = []int{15, 30, 50}
+
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
+
+	cats1 := []string{"IAB1-3"}
+	cats2 := []string{"IAB1-4"}
+	cats3 := []string{"IAB1-1000"}
+	bid1 := openrtb.Bid{ID: "bid_id1", ImpID: "imp_id1", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid2 := openrtb.Bid{ID: "bid_id2", ImpID: "imp_id2", Price: 20.0000, Cat: cats2, W: 1, H: 1}
+	bid3 := openrtb.Bid{ID: "bid_id3", ImpID: "imp_id3", Price: 30.0000, Cat: cats3, W: 1, H: 1}
+
+	bid1_1 := pbsOrtbBid{&bid1, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_2 := pbsOrtbBid{&bid2, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 40}}
+	bid1_3 := pbsOrtbBid{&bid3, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+
+	innerBids := []*pbsOrtbBid{
+		&bid1_1,
+		&bid1_2,
+		&bid1_3,
+	}
+
+	seatBid := pbsOrtbSeatBid{innerBids, "USD", nil, nil}
+	bidderName1 := openrtb_ext.BidderName("appnexus")
+
+	adapterBids[bidderName1] = &seatBid
+
+	bidCategory, adapterBids, err := applyCategoryMapping(nil, requestExt, adapterBids, categoriesFetcher, targData)
+
+	assert.Equal(t, nil, err, "Category mapping error should be empty")
+	assert.Equal(t, "10.00_IAB1-3_30s", bidCategory["bid_id1"], "Category should not be translated")
+	assert.Equal(t, "20.00_IAB1-4_50s", bidCategory["bid_id2"], "Category should not be translated")
+	assert.Equal(t, "20.00_IAB1-1000_30s", bidCategory["bid_id3"], "Bid should not be rejected")
+	assert.Equal(t, 3, len(adapterBids[bidderName1].bids), "Bidders number doesn't match")
+	assert.Equal(t, 3, len(bidCategory), "Bidders category mapping doesn't match")
+}
+
+func TestCategoryDedupe(t *testing.T) {
+
+	categoriesFetcher, error := newCategoryFetcher("./test/category-mapping")
+	if error != nil {
+		t.Errorf("Failed to create a category Fetcher: %v", error)
+	}
+
+	requestExt := newExtRequest()
+
+	targData := &targetData{
+		priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
+		includeWinners:   true,
+	}
+
+	adapterBids := make(map[openrtb_ext.BidderName]*pbsOrtbSeatBid)
+
+	cats1 := []string{"IAB1-3"}
+	cats2 := []string{"IAB1-4"}
+	// bid3 will be same price, category, and duration as bid1 so one of them should get removed
+	cats4 := []string{"IAB1-2000"}
+	bid1 := openrtb.Bid{ID: "bid_id1", ImpID: "imp_id1", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid2 := openrtb.Bid{ID: "bid_id2", ImpID: "imp_id2", Price: 15.0000, Cat: cats2, W: 1, H: 1}
+	bid3 := openrtb.Bid{ID: "bid_id3", ImpID: "imp_id3", Price: 10.0000, Cat: cats1, W: 1, H: 1}
+	bid4 := openrtb.Bid{ID: "bid_id4", ImpID: "imp_id4", Price: 20.0000, Cat: cats4, W: 1, H: 1}
+
+	bid1_1 := pbsOrtbBid{&bid1, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_2 := pbsOrtbBid{&bid2, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 50}}
+	bid1_3 := pbsOrtbBid{&bid3, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+	bid1_4 := pbsOrtbBid{&bid4, "video", nil, &openrtb_ext.ExtBidPrebidVideo{Duration: 30}}
+
+	selectedBids := make(map[string]int)
+	expectedCategories := map[string]string{
+		"bid_id1": "10.00_Electronics_30s",
+		"bid_id2": "14.00_Sports_50s",
+		"bid_id3": "10.00_Electronics_30s",
+	}
+
+	numIterations := 10
+
+	// Run the function many times, this should be enough for the 50% chance of which bid to remove to remove bid1 sometimes
+	// and bid3 others. It's conceivably possible (but highly unlikely) that the same bid get chosen every single time, but
+	// if you notice false fails from this test increase numIterations to make it even less likely to happen.
+	for i := 0; i < numIterations; i++ {
+		innerBids := []*pbsOrtbBid{
+			&bid1_1,
+			&bid1_2,
+			&bid1_3,
+			&bid1_4,
+		}
+
+		seatBid := pbsOrtbSeatBid{innerBids, "USD", nil, nil}
+		bidderName1 := openrtb_ext.BidderName("appnexus")
+
+		adapterBids[bidderName1] = &seatBid
+
+		bidCategory, adapterBids, err := applyCategoryMapping(nil, requestExt, adapterBids, categoriesFetcher, targData)
+
+		assert.Equal(t, nil, err, "Category mapping error should be empty")
+		assert.Equal(t, 2, len(adapterBids[bidderName1].bids), "Bidders number doesn't match")
+		assert.Equal(t, 2, len(bidCategory), "Bidders category mapping doesn't match")
+
+		for bidId, bidCat := range bidCategory {
+			assert.Equal(t, expectedCategories[bidId], bidCat, "Category mapping doesn't match")
+			selectedBids[bidId]++
+		}
+	}
+
+	assert.Equal(t, numIterations, selectedBids["bid_id2"], "Bid 2 did not make it through every time")
+	assert.NotEqual(t, numIterations, selectedBids["bid_id1"], "Bid 1 made it through every time")
+	assert.NotEqual(t, numIterations, selectedBids["bid_id3"], "Bid 3 made it through every time")
+}
+
+type exchangeSpec struct {
+	IncomingRequest  exchangeRequest        `json:"incomingRequest"`
+	OutgoingRequests map[string]*bidderSpec `json:"outgoingRequests"`
+	Response         exchangeResponse       `json:"response,omitempty"`
+	EnforceCCPA      bool                   `json:"enforceCcpa"`
+}
+
+type exchangeRequest struct {
+	OrtbRequest openrtb.BidRequest `json:"ortbRequest"`
+	Usersyncs   map[string]string  `json:"usersyncs"`
+}
+
+type exchangeResponse struct {
+	Bids  *openrtb.BidResponse `json:"bids"`
+	Error string               `json:"error,omitempty"`
+}
+
+type bidderSpec struct {
+	ExpectedRequest *bidderRequest `json:"expectRequest"`
+	MockResponse    bidderResponse `json:"mockResponse"`
+}
+
+type bidderRequest struct {
+	OrtbRequest   openrtb.BidRequest `json:"ortbRequest"`
+	BidAdjustment float64            `json:"bidAdjustment"`
+}
+
+type bidderResponse struct {
+	SeatBid *bidderSeatBid `json:"pbsSeatBid,omitempty"`
+	Errors  []string       `json:"errors,omitempty"`
+}
+
+// bidderSeatBid is basically a subset of pbsOrtbSeatBid from exchange/bidder.go.
+// The only real reason I'm not reusing that type is because I don't want people to think that the
+// JSON property tags on those types are contracts in prod.
+type bidderSeatBid struct {
+	Bids []bidderBid `json:"pbsBids,omitempty"`
+}
+
+// bidderBid is basically a subset of pbsOrtbBid from exchange/bidder.go.
+// See the comment on bidderSeatBid for more info.
+type bidderBid struct {
+	Bid  *openrtb.Bid `json:"ortbBid,omitempty"`
+	Type string       `json:"bidType,omitempty"`
+}
+
+type mockIdFetcher map[string]string
+
+func (f mockIdFetcher) GetId(bidder openrtb_ext.BidderName) (id string, ok bool) {
+	id, ok = f[string(bidder)]
 	return
 }
 
-func assertStringValue(t *testing.T, object string, expect string, value string) {
+type validatingBidder struct {
+	t          *testing.T
+	fileName   string
+	bidderName string
+
+	// These are maps because they may contain aliases. They should _at least_ contain an entry for bidderName.
+	expectations  map[string]*bidderRequest
+	mockResponses map[string]bidderResponse
+}
+
+func (b *validatingBidder) requestBid(ctx context.Context, request *openrtb.BidRequest, name openrtb_ext.BidderName, bidAdjustment float64, conversions currencies.Conversions, reqInfo *adapters.ExtraRequestInfo) (seatBid *pbsOrtbSeatBid, errs []error) {
+	if expectedRequest, ok := b.expectations[string(name)]; ok {
+		if expectedRequest != nil {
+			if expectedRequest.BidAdjustment != bidAdjustment {
+				b.t.Errorf("%s: Bidder %s got wrong bid adjustment. Expected %f, got %f", b.fileName, name, expectedRequest.BidAdjustment, bidAdjustment)
+			}
+			diffOrtbRequests(b.t, fmt.Sprintf("Request to %s in %s", string(name), b.fileName), &expectedRequest.OrtbRequest, request)
+		}
+	} else {
+		b.t.Errorf("%s: Bidder %s got unexpected request for alias %s. No input assertions.", b.fileName, b.bidderName, name)
+	}
+
+	if mockResponse, ok := b.mockResponses[string(name)]; ok {
+		if mockResponse.SeatBid != nil {
+			bids := make([]*pbsOrtbBid, len(mockResponse.SeatBid.Bids))
+			for i := 0; i < len(bids); i++ {
+				bids[i] = &pbsOrtbBid{
+					bid:     mockResponse.SeatBid.Bids[i].Bid,
+					bidType: openrtb_ext.BidType(mockResponse.SeatBid.Bids[i].Type),
+				}
+			}
+
+			seatBid = &pbsOrtbSeatBid{
+				bids: bids,
+			}
+		}
+
+		for _, err := range mockResponse.Errors {
+			errs = append(errs, errors.New(err))
+		}
+	} else {
+		b.t.Errorf("%s: Bidder %s got unexpected request for alias %s. No mock responses.", b.fileName, b.bidderName, name)
+	}
+
+	return
+}
+
+func diffOrtbRequests(t *testing.T, description string, expected *openrtb.BidRequest, actual *openrtb.BidRequest) {
 	t.Helper()
-	if expect != value {
-		t.Errorf("Wrong value for %s, expected \"%s\", got \"%s\"", object, expect, value)
-	}
-}
-
-type mockAdapter struct {
-	seatBid *pbsOrtbSeatBid
-	errs    []error
-}
-
-func (a *mockAdapter) requestBid(ctx context.Context, request *openrtb.BidRequest, name openrtb_ext.BidderName) (*pbsOrtbSeatBid, []error) {
-	return a.seatBid, a.errs
-}
-
-const (
-	BidderDummy  openrtb_ext.BidderName = "dummy"
-	BidderDummy2 openrtb_ext.BidderName = "dummy2"
-	BidderDummy3 openrtb_ext.BidderName = "dummy3"
-)
-
-// Tester is responsible for filling bid results into the adapters
-func NewDummyExchange(client *http.Client) *exchange {
-	e := new(exchange)
-	a := new(mockAdapter)
-	a.errs = make([]error, 0, 5)
-
-	b := new(mockAdapter)
-	b.errs = make([]error, 0, 5)
-
-	c := new(mockAdapter)
-	c.errs = make([]error, 0, 5)
-
-	e.adapterMap = map[openrtb_ext.BidderName]adaptedBidder{
-		BidderDummy:  a,
-		BidderDummy2: b,
-		BidderDummy3: c,
+	actualJSON, err := json.Marshal(actual)
+	if err != nil {
+		t.Fatalf("%s failed to marshal actual BidRequest into JSON. %v", description, err)
 	}
 
-	// adapterList := []openrtb_ext.BidderName{BidderDummy, BidderDummy2, BidderDummy3}
+	expectedJSON, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("%s failed to marshal expected BidRequest into JSON. %v", description, err)
+	}
 
-	e.me = &pbsmetrics.DummyMetricsEngine{}
-	e.cache = &wellBehavedCache{}
-	return e
+	diffJson(t, description, actualJSON, expectedJSON)
+}
+
+func diffOrtbResponses(t *testing.T, description string, expected *openrtb.BidResponse, actual *openrtb.BidResponse) {
+	t.Helper()
+	// The OpenRTB spec is wonky here. Since "bidresponse.seatbid" is an array, order technically matters to any JSON diff or
+	// deep equals method. However, for all intents and purposes it really *doesn't* matter. ...so this nasty logic makes compares
+	// the seatbids in an order-independent way.
+	//
+	// Note that the same thing is technically true of the "seatbid[i].bid" array... but since none of our exchange code relies on
+	// this implementation detail, I'm cutting a corner and ignoring it here.
+	actualSeats := mapifySeatBids(t, description, actual.SeatBid)
+	expectedSeats := mapifySeatBids(t, description, expected.SeatBid)
+	actualJSON, err := json.Marshal(actualSeats)
+	if err != nil {
+		t.Fatalf("%s failed to marshal actual BidResponse into JSON. %v", description, err)
+	}
+
+	expectedJSON, err := json.Marshal(expectedSeats)
+	if err != nil {
+		t.Fatalf("%s failed to marshal expected BidResponse into JSON. %v", description, err)
+	}
+
+	diffJson(t, description, actualJSON, expectedJSON)
+}
+
+func mapifySeatBids(t *testing.T, context string, seatBids []openrtb.SeatBid) map[string]*openrtb.SeatBid {
+	seatMap := make(map[string]*openrtb.SeatBid, len(seatBids))
+	for i := 0; i < len(seatBids); i++ {
+		seatName := seatBids[i].Seat
+		if _, ok := seatMap[seatName]; ok {
+			t.Fatalf("%s: Contains duplicate Seat: %s", context, seatName)
+		} else {
+			seatMap[seatName] = &seatBids[i]
+		}
+	}
+	return seatMap
+}
+
+// diffJson compares two JSON byte arrays for structural equality. It will produce an error if either
+// byte array is not actually JSON.
+func diffJson(t *testing.T, description string, actual []byte, expected []byte) {
+	t.Helper()
+	diff, err := gojsondiff.New().Compare(actual, expected)
+	if err != nil {
+		t.Fatalf("%s json diff failed. %v", description, err)
+	}
+
+	if diff.Modified() {
+		var left interface{}
+		if err := json.Unmarshal(actual, &left); err != nil {
+			t.Fatalf("%s json did not match, but unmarhsalling failed. %v", description, err)
+		}
+		printer := formatter.NewAsciiFormatter(left, formatter.AsciiFormatterConfig{
+			ShowArrayIndex: true,
+		})
+		output, err := printer.Format(diff)
+		if err != nil {
+			t.Errorf("%s did not match, but diff formatting failed. %v", description, err)
+		} else {
+			t.Errorf("%s json did not match expected.\n\n%s", description, output)
+		}
+	}
 }
 
 func mockHandler(statusCode int, getBody string, postBody string) http.Handler {
@@ -570,172 +1290,37 @@ func mockHandler(statusCode int, getBody string, postBody string) http.Handler {
 	})
 }
 
-func mockAdapterConfig1(a *mockAdapter, adapter string) {
-	a.seatBid, a.errs = mockDummyBids1(adapter)
-}
-
-func mockAdapterConfig2(a *mockAdapter, adapter string) {
-	a.seatBid, a.errs = mockDummyBids2(adapter)
-}
-
-func mockAdapterConfig3(a *mockAdapter, adapter string) {
-	a.seatBid, a.errs = mockDummyBids3(adapter)
-}
-
-func mockAdapterConfigErr1(a *mockAdapter) {
-	a.seatBid, a.errs = mockDummyBidsErr1()
-}
-
-func mockAdapterConfigErr2(a *mockAdapter) {
-	a.seatBid, a.errs = mockDummyBidsErr2()
-}
-
-func mockDummyBids1(adapter string) (*pbsOrtbSeatBid, []error) {
-	var err error
-	sb1 := new(pbsOrtbSeatBid)
-	sb1.bids = make([]*pbsOrtbBid, 2)
-	sb1.bids[0] = new(pbsOrtbBid)
-	sb1.bids[1] = new(pbsOrtbBid)
-	sb1.bids[0].bid = new(openrtb.Bid)
-	sb1.bids[1].bid = new(openrtb.Bid)
-	sb1.bids[0].bid.ID = "1234567890"
-	sb1.bids[0].bid.W = 728
-	sb1.bids[0].bid.H = 90
-	sb1.bids[0].bid.Price = 1.34
-	sb1.bids[0].bid.ImpID = "1stImp"
-	sb1.bids[0].bid.CrID = "12"
-	targ := make(map[string]string)
-	targ["hb_pb_"+adapter] = "1.30"
-	targ["hb_bidder_"+adapter] = adapter
-	targ["hb_size_"+adapter] = "728x90"
-	sb1.bids[0].bidTargets = targ
-	fmt.Println(string(sb1.bids[0].bid.Ext))
-	if err != nil {
-		fmt.Println("ERROR: Packing ext[0] in mockDummyBids1: " + err.Error())
-	}
-	sb1.bids[1].bid.ID = "1234567890"
-	sb1.bids[1].bid.W = 300
-	sb1.bids[1].bid.H = 250
-	sb1.bids[1].bid.Price = 0.73
-	sb1.bids[1].bid.ImpID = "2ndImp"
-	sb1.bids[1].bid.CrID = "34"
-	targ = make(map[string]string)
-	targ["hb_pb_"+adapter] = "0.70"
-	targ["hb_bidder_"+adapter] = adapter
-	targ["hb_size_"+adapter] = "300x250"
-	sb1.bids[1].bidTargets = targ
-	fmt.Println(string(sb1.bids[0].bid.Ext))
-	if err != nil {
-		fmt.Println("ERROR: Packing ext[0] in mockDummyBids1: " + err.Error())
-	}
-
-	errs := make([]error, 0, 5)
-
-	return sb1, errs
-}
-
-func mockDummyBids2(adapter string) (*pbsOrtbSeatBid, []error) {
-	var err error
-	sb1 := new(pbsOrtbSeatBid)
-	sb1.bids = make([]*pbsOrtbBid, 2)
-	sb1.bids[0] = new(pbsOrtbBid)
-	sb1.bids[1] = new(pbsOrtbBid)
-	sb1.bids[0].bid = new(openrtb.Bid)
-	sb1.bids[1].bid = new(openrtb.Bid)
-	sb1.bids[0].bid.ID = "ABC"
-	sb1.bids[0].bid.W = 728
-	sb1.bids[0].bid.H = 90
-	sb1.bids[0].bid.Price = 0.94
-	sb1.bids[0].bid.ImpID = "1stImp"
-	sb1.bids[0].bid.CrID = "123"
-	targ := make(map[string]string)
-	targ["hb_pb_"+adapter] = "0.90"
-	targ["hb_bidder_"+adapter] = adapter
-	targ["hb_size_"+adapter] = "728x90"
-	sb1.bids[0].bidTargets = targ
-	fmt.Println(string(sb1.bids[0].bid.Ext))
-	if err != nil {
-		fmt.Println("ERROR: Packing ext[0] in mockDummyBids1: " + err.Error())
-	}
-	sb1.bids[1].bid.ID = "1234"
-	sb1.bids[1].bid.W = 300
-	sb1.bids[1].bid.H = 250
-	sb1.bids[1].bid.Price = 1.89
-	sb1.bids[1].bid.ImpID = "2ndImp"
-	sb1.bids[1].bid.CrID = "456"
-	targ = make(map[string]string)
-	targ["hb_pb_"+adapter] = "1.80"
-	targ["hb_bidder_"+adapter] = adapter
-	targ["hb_size_"+adapter] = "300x250"
-	sb1.bids[1].bidTargets = targ
-	fmt.Println(string(sb1.bids[0].bid.Ext))
-	if err != nil {
-		fmt.Println("ERROR: Packing ext[0] in mockDummyBids1: " + err.Error())
-	}
-
-	errs := make([]error, 0, 5)
-
-	return sb1, errs
-}
-func mockDummyBids3(adapter string) (*pbsOrtbSeatBid, []error) {
-	var err error
-	sb1 := new(pbsOrtbSeatBid)
-	sb1.bids = make([]*pbsOrtbBid, 1)
-	sb1.bids[0] = new(pbsOrtbBid)
-	sb1.bids[0].bid = new(openrtb.Bid)
-	sb1.bids[0].bid.ID = "MyBid"
-	sb1.bids[0].bid.W = 728
-	sb1.bids[0].bid.H = 90
-	sb1.bids[0].bid.Price = 0.34
-	sb1.bids[0].bid.ImpID = "1stImp"
-	sb1.bids[0].bid.CrID = "135"
-	targ := make(map[string]string)
-	targ["hb_pb_"+adapter] = "0.30"
-	targ["hb_bidder_"+adapter] = adapter
-	targ["hb_size_"+adapter] = "728x90"
-	sb1.bids[0].bidTargets = targ
-	fmt.Println(string(sb1.bids[0].bid.Ext))
-	if err != nil {
-		fmt.Println("ERROR: Packing ext[0] in mockDummyBids1: " + err.Error())
-	}
-
-	errs := make([]error, 0, 5)
-
-	return sb1, errs
-}
-func mockDummyBidsErr1() (*pbsOrtbSeatBid, []error) {
-	sb1 := new(pbsOrtbSeatBid)
-	sb1.bids = nil
-
-	errs := make([]error, 0, 5)
-	errs = append(errs, errors.New("This was an error"))
-	errs = append(errs, errors.New("Another error goes here"))
-
-	return sb1, errs
-}
-func mockDummyBidsErr2() (*pbsOrtbSeatBid, []error) {
-	var sb1 *pbsOrtbSeatBid = nil
-
-	errs := make([]error, 0, 5)
-	errs = append(errs, errors.New("This was a FATAL error"))
-
-	return sb1, errs
-}
-
-func convertErr2Str(e []error) []string {
-	s := make([]string, len(e))
-	for i := 0; i < len(e); i++ {
-		s[i] = e[i].Error()
-	}
-	return s
-}
-
 type wellBehavedCache struct{}
 
-func (c *wellBehavedCache) PutJson(ctx context.Context, values []json.RawMessage) []string {
+func (c *wellBehavedCache) GetExtCacheData() (string, string) {
+	return "www.pbcserver.com", "/pbcache/endpoint"
+}
+
+func (c *wellBehavedCache) PutJson(ctx context.Context, values []prebid_cache_client.Cacheable) ([]string, []error) {
 	ids := make([]string, len(values))
 	for i := 0; i < len(values); i++ {
 		ids[i] = strconv.Itoa(i)
 	}
-	return ids
+	return ids, nil
+}
+
+type emptyUsersync struct{}
+
+func (e *emptyUsersync) GetId(bidder openrtb_ext.BidderName) (string, bool) {
+	return "", false
+}
+
+type mockUsersync struct {
+	syncs map[string]string
+}
+
+func (e *mockUsersync) GetId(bidder openrtb_ext.BidderName) (id string, exists bool) {
+	id, exists = e.syncs[string(bidder)]
+	return
+}
+
+type panicingAdapter struct{}
+
+func (panicingAdapter) requestBid(ctx context.Context, request *openrtb.BidRequest, name openrtb_ext.BidderName, bidAdjustment float64, conversions currencies.Conversions, reqInfo *adapters.ExtraRequestInfo) (posb *pbsOrtbSeatBid, errs []error) {
+	panic("Panic! Panic! The world is ending!")
 }
