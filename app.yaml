@@ -1,3 +1,7 @@
 runtime: go112
 env_variables:
   PBS_PORT: 8000
+
+handlers:
+- url: /info/bidders
+  script: auto
