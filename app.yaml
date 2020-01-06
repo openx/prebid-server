@@ -5,3 +5,5 @@ env_variables:
 handlers:
 - url: /info/bidders
   script: auto
+- url: /info/bidders/*
+  script: auto
