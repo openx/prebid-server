@@ -1,6 +1,12 @@
 runtime: go112
+
 env_variables:
   PBS_PORT: 8000
+  PBS_ADMIN_PORT: 9000
+  PBS_ENABLE_GZIP: true
+  GLOG_logtostderr: 1
+  GLOG_v: 1
+
 
 handlers:
 - url: /info/bidders
