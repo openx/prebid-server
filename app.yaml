@@ -1,15 +1,13 @@
-runtime: go112
+runtime: go113
 
 env_variables:
-  PBS_PORT: 8000
-  PBS_ADMIN_PORT: 9000
+  PBS_PORT: 8080
+  PBS_ADMIN_PORT: 8090
   PBS_ENABLE_GZIP: true
-  GLOG_logtostderr: 1
-  GLOG_v: 1
 
 
 handlers:
-- url: /info/bidders
-  script: auto
-- url: /info/bidders/*
+- url: /.*
+  secure: always
+  redirect_http_response_code: 301
   script: auto
