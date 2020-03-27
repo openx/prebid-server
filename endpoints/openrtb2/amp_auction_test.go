@@ -902,7 +902,7 @@ type mockAmpExchange struct {
 	lastRequest *openrtb.BidRequest
 }
 
-func (m *mockAmpExchange) HoldAuction(ctx context.Context, bidRequest *openrtb.BidRequest, ids exchange.IdFetcher, labels pbsmetrics.Labels, categoriesFetcher *stored_requests.CategoryFetcher) (*openrtb.BidResponse, error) {
+func (m *mockAmpExchange) HoldAuction(ctx context.Context, bidRequest *openrtb.BidRequest, ids exchange.IdFetcher, labels pbsmetrics.Labels, categoriesFetcher *stored_requests.CategoryFetcher, debugLog *exchange.DebugLog) (*openrtb.BidResponse, error) {
 	m.lastRequest = bidRequest
 
 	response := &openrtb.BidResponse{
@@ -966,7 +966,7 @@ func getTestBidRequest(nilUser bool, nilExt bool, consentString string, digitrus
 		Imp: []openrtb.Imp{
 			{
 				ID:  "/19968336/header-bid-tag-0",
-				Ext: json.RawMessage(`{"appnexus": { "placementId":10433394 }}`),
+				Ext: json.RawMessage(`{"appnexus": { "placementId":12883451 }}`),
 				Banner: &openrtb.Banner{
 					Format: []openrtb.Format{
 						{

@@ -18,6 +18,7 @@ func TestNewSyncerMap(t *testing.T) {
 			string(openrtb_ext.BidderAdform):           syncConfig,
 			string(openrtb_ext.BidderAdkernel):         syncConfig,
 			string(openrtb_ext.BidderAdkernelAdn):      syncConfig,
+			string(openrtb_ext.BidderAdmixer):          syncConfig,
 			string(openrtb_ext.BidderAdpone):           syncConfig,
 			string(openrtb_ext.BidderAdtelligent):      syncConfig,
 			string(openrtb_ext.BidderAdvangelists):     syncConfig,
@@ -26,6 +27,7 @@ func TestNewSyncerMap(t *testing.T) {
 			string(openrtb_ext.BidderBrightroll):       syncConfig,
 			string(openrtb_ext.BidderConsumable):       syncConfig,
 			string(openrtb_ext.BidderConversant):       syncConfig,
+			string(openrtb_ext.BidderCpmstar):          syncConfig,
 			string(openrtb_ext.BidderDatablocks):       syncConfig,
 			string(openrtb_ext.BidderEmxDigital):       syncConfig,
 			string(openrtb_ext.BidderEngageBDR):        syncConfig,
@@ -51,22 +53,28 @@ func TestNewSyncerMap(t *testing.T) {
 			string(openrtb_ext.BidderSomoaudience):     syncConfig,
 			string(openrtb_ext.BidderSonobi):           syncConfig,
 			string(openrtb_ext.BidderSovrn):            syncConfig,
+			string(openrtb_ext.BidderSmartRTB):         syncConfig,
 			string(openrtb_ext.BidderSynacormedia):     syncConfig,
 			string(openrtb_ext.BidderTriplelift):       syncConfig,
 			string(openrtb_ext.BidderTripleliftNative): syncConfig,
+			string(openrtb_ext.BidderUcfunnel):         syncConfig,
 			string(openrtb_ext.BidderUnruly):           syncConfig,
+			string(openrtb_ext.BidderValueImpression):  syncConfig,
 			string(openrtb_ext.BidderVerizonMedia):     syncConfig,
 			string(openrtb_ext.BidderVisx):             syncConfig,
 			string(openrtb_ext.BidderVrtcal):           syncConfig,
 			string(openrtb_ext.BidderYieldmo):          syncConfig,
+			string(openrtb_ext.BidderZeroClickFraud):   syncConfig,
 		},
 	}
 
 	adaptersWithoutSyncers := map[openrtb_ext.BidderName]bool{
+		openrtb_ext.BidderAdoppler:  true,
 		openrtb_ext.BidderApplogy:   true,
 		openrtb_ext.BidderTappx:     true,
 		openrtb_ext.BidderKubient:   true,
 		openrtb_ext.BidderPubnative: true,
+		openrtb_ext.BidderKidoz:     true,
 	}
 
 	for bidder, config := range cfg.Adapters {
