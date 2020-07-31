@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/stored_requests"
 
 	"github.com/golang/glog"
@@ -79,6 +80,10 @@ func (fetcher *HttpFetcher) FetchRequests(ctx context.Context, requestIDs []stri
 	defer httpResp.Body.Close()
 	requestData, impData, errs = unpackResponse(httpResp)
 	return
+}
+
+func (fetcher *HttpFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	return &config.UnknownAccount, nil
 }
 
 func (fetcher *HttpFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

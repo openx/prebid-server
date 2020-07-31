@@ -35,7 +35,7 @@ import (
 
 var defaultRequestTimeout int64 = 5000
 
-func NewVideoEndpoint(ex exchange.Exchange, validator openrtb_ext.BidderParamValidator, requestsById stored_requests.Fetcher, videoFetcher stored_requests.Fetcher, categories stored_requests.CategoryFetcher, cfg *config.Configuration, met pbsmetrics.MetricsEngine, pbsAnalytics analytics.PBSAnalyticsModule, disabledBidders map[string]string, defReqJSON []byte, bidderMap map[string]openrtb_ext.BidderName, cache prebid_cache_client.Client) (httprouter.Handle, error) {
+func NewVideoEndpoint(ex exchange.Exchange, validator openrtb_ext.BidderParamValidator, requestsById stored_requests.Fetcher, videoFetcher stored_requests.Fetcher, accounts stored_requests.AccountFetcher, categories stored_requests.CategoryFetcher, cfg *config.Configuration, met pbsmetrics.MetricsEngine, pbsAnalytics analytics.PBSAnalyticsModule, disabledBidders map[string]string, defReqJSON []byte, bidderMap map[string]openrtb_ext.BidderName, cache prebid_cache_client.Client) (httprouter.Handle, error) {
 
 	if ex == nil || validator == nil || requestsById == nil || cfg == nil || met == nil {
 		return nil, errors.New("NewVideoEndpoint requires non-nil arguments.")
@@ -55,6 +55,7 @@ func NewVideoEndpoint(ex exchange.Exchange, validator openrtb_ext.BidderParamVal
 		validator,
 		requestsById,
 		videoFetcher,
+		accounts,
 		categories,
 		cfg,
 		met,
@@ -253,7 +254,8 @@ func (deps *endpointDeps) VideoAuctionEndpoint(w http.ResponseWriter, r *http.Re
 		labels.PubID = effectivePubID(bidReq.Site.Publisher)
 	}
 
-	if acctIdErr := validateAccount(deps.cfg, labels.PubID); acctIdErr != nil {
+	_, acctIdErr := deps.validateAccount(ctx, labels.PubID)
+	if acctIdErr != nil {
 		errL := []error{err}
 		handleError(&labels, w, errL, &vo, &debugLog)
 		return

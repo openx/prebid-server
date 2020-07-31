@@ -38,6 +38,8 @@ type Configuration struct {
 	DataCache       DataCache          `mapstructure:"datacache"`
 	StoredRequests  StoredRequests     `mapstructure:"stored_requests"`
 	CategoryMapping StoredRequestsSlim `mapstructure:"category_mapping"`
+	Accounts        StoredRequestsSlim `mapstructure:"accounts"`
+	DefaultAccount  Account            `mapstructure:"default_account"`
 	// Note that StoredVideo refers to stored video requests, and has nothing to do with caching video creatives.
 	StoredVideo StoredRequestsSlim `mapstructure:"stored_video_req"`
 
@@ -510,6 +512,14 @@ func New(v *viper.Viper) (*Configuration, error) {
 		return nil, err
 	}
 
+	// Migrate some settings to default account
+	c.DefaultAccount.Disabled = c.AccountRequired
+	c.DefaultAccount.GDPR = c.GDPR.TCF2
+	c.DefaultAccount.CCPA = c.CCPA
+
+	if len(c.GDPR.NonStandardPublishers) > 0 {
+		glog.Fatalf("gdpr.non_standard_publishers has been deprecated; use per-account gdpr.enabled=false setting instead")
+	}
 	// To look for a request's publisher_id in the NonStandardPublishers list in
 	// O(1) time, we fill this hash table located in the NonStandardPublisherMap field of GDPR
 	c.GDPR.NonStandardPublisherMap = make(map[string]int)
@@ -524,6 +534,9 @@ func New(v *viper.Viper) (*Configuration, error) {
 		c.BlacklistedAppMap[c.BlacklistedApps[i]] = true
 	}
 
+	if len(c.BlacklistedAccts) > 0 && c.BlacklistedAccts[0] != "" {
+		glog.Fatalf("blacklisted_accts has been deprecated; use per-account disabled=true setting or global account_required=true instead. %d", len(c.BlacklistedAccts))
+	}
 	// To look for a request's account id in O(1) time, we fill this hash table located in the
 	// the BlacklistedAccts field of the Configuration struct defined in this file
 	c.BlacklistedAcctMap = make(map[string]bool)

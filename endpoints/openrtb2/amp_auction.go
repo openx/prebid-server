@@ -44,6 +44,7 @@ func NewAmpEndpoint(
 	ex exchange.Exchange,
 	validator openrtb_ext.BidderParamValidator,
 	requestsById stored_requests.Fetcher,
+	accounts stored_requests.AccountFetcher,
 	categories stored_requests.CategoryFetcher,
 	cfg *config.Configuration,
 	met pbsmetrics.MetricsEngine,
@@ -69,6 +70,7 @@ func NewAmpEndpoint(
 		validator,
 		requestsById,
 		empty_fetcher.EmptyFetcher{},
+		accounts,
 		categories,
 		cfg,
 		met,
@@ -155,8 +157,8 @@ func (deps *endpointDeps) AmpAuction(w http.ResponseWriter, r *http.Request, _ h
 		labels.CookieFlag = pbsmetrics.CookieFlagYes
 	}
 	labels.PubID = effectivePubID(req.Site.Publisher)
-	// Blacklist account now that we have resolved the value
-	if acctIdErr := validateAccount(deps.cfg, labels.PubID); acctIdErr != nil {
+	_, acctIdErr := deps.validateAccount(ctx, labels.PubID)
+	if acctIdErr != nil {
 		errL = append(errL, acctIdErr)
 		errCode := errortypes.ReadCode(acctIdErr)
 		if errCode == errortypes.BlacklistedAppErrorCode || errCode == errortypes.BlacklistedAcctErrorCode {

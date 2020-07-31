@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"strings"
 
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/stored_requests"
 )
 
@@ -31,6 +32,21 @@ func (fetcher *eagerFetcher) FetchRequests(ctx context.Context, requestIDs []str
 	errs := appendErrors("Request", requestIDs, storedRequests, nil)
 	errs = appendErrors("Imp", impIDs, storedImpressions, errs)
 	return storedRequests, storedImpressions, errs
+}
+
+// FetchAccount fetches the host account configuration for a publisher
+func (fetcher *eagerFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	account := new(config.Account)
+	var err error
+	if rawJSON, ok := fetcher.FileSystem.Directories["accounts"].Files[accountID]; ok {
+		err = json.Unmarshal(rawJSON, account)
+	} else {
+		err = fmt.Errorf("Account %s not found", accountID)
+	}
+	if err != nil {
+		account = &config.UnknownAccount
+	}
+	return account, err
 }
 
 func (fetcher *eagerFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

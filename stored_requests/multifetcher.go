@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"github.com/prebid/prebid-server/config"
 )
 
 // MultiFetcher is a Fetcher composed of multiple sub-Fetchers that are all polled for results.
@@ -34,6 +36,17 @@ func (mf MultiFetcher) FetchRequests(ctx context.Context, requestIDs []string, i
 	errs = appendNotFoundErrors("Request", requestIDs, requestData, errs)
 	errs = appendNotFoundErrors("Imp", impIDs, impData, errs)
 	return
+}
+
+func (mf MultiFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	for _, f := range mf {
+		if af, ok := f.(AccountFetcher); ok {
+			if account, err := af.FetchAccount(ctx, accountID); err == nil {
+				return account, nil
+			}
+		}
+	}
+	return &config.UnknownAccount, NotFoundError{accountID, "Account"}
 }
 
 func (mf MultiFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

@@ -8,6 +8,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/golang/glog"
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/stored_requests"
 )
 
@@ -91,6 +92,10 @@ func (fetcher *dbFetcher) FetchRequests(ctx context.Context, requestIDs []string
 	errs = appendErrors("Imp", impIDs, storedImpData, errs)
 
 	return storedRequestData, storedImpData, errs
+}
+
+func (fetcher *dbFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	return &config.UnknownAccount, nil
 }
 
 func (fetcher *dbFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

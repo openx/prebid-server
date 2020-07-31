@@ -105,7 +105,7 @@ func CreateStoredRequests(cfg *config.StoredRequestsSlim, metricsEngine pbsmetri
 //
 // As a side-effect, it will add some endpoints to the router if the config calls for it.
 // In the future we should look for ways to simplify this so that it's not doing two things.
-func NewStoredRequests(cfg *config.Configuration, metricsEngine pbsmetrics.MetricsEngine, client *http.Client, router *httprouter.Router) (db *sql.DB, shutdown func(), fetcher stored_requests.Fetcher, ampFetcher stored_requests.Fetcher, categoriesFetcher stored_requests.CategoryFetcher, videoFetcher stored_requests.Fetcher) {
+func NewStoredRequests(cfg *config.Configuration, metricsEngine pbsmetrics.MetricsEngine, client *http.Client, router *httprouter.Router) (db *sql.DB, shutdown func(), fetcher stored_requests.Fetcher, ampFetcher stored_requests.Fetcher, accountsFetcher stored_requests.AccountFetcher, categoriesFetcher stored_requests.CategoryFetcher, videoFetcher stored_requests.Fetcher) {
 	// Build individual slim options from combined config struct
 	slimAuction, slimAmp := resolvedStoredRequestsConfig(cfg)
 
@@ -120,6 +120,7 @@ func NewStoredRequests(cfg *config.Configuration, metricsEngine pbsmetrics.Metri
 	fetcher2, shutdown2 := CreateStoredRequests(&slimAmp, metricsEngine, client, router, &dbc)
 	fetcher3, shutdown3 := CreateStoredRequests(&cfg.CategoryMapping, metricsEngine, client, router, &dbc)
 	fetcher4, shutdown4 := CreateStoredRequests(&cfg.StoredVideo, metricsEngine, client, router, &dbc)
+	fetcher5, shutdown5 := CreateStoredRequests(&cfg.Accounts, metricsEngine, client, router, &dbc)
 
 	db = dbc.db
 
@@ -127,12 +128,14 @@ func NewStoredRequests(cfg *config.Configuration, metricsEngine pbsmetrics.Metri
 	ampFetcher = fetcher2.(stored_requests.Fetcher)
 	categoriesFetcher = fetcher3.(stored_requests.CategoryFetcher)
 	videoFetcher = fetcher4.(stored_requests.Fetcher)
+	accountsFetcher = fetcher5.(stored_requests.AccountFetcher)
 
 	shutdown = func() {
 		shutdown1()
 		shutdown2()
 		shutdown3()
 		shutdown4()
+		shutdown5()
 	}
 
 	return
