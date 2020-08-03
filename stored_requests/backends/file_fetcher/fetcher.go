@@ -36,6 +36,9 @@ func (fetcher *eagerFetcher) FetchRequests(ctx context.Context, requestIDs []str
 
 // FetchAccount fetches the host account configuration for a publisher
 func (fetcher *eagerFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	if len(accountID) == 0 {
+		return nil, fmt.Errorf("Cannot look up an empty accountID")
+	}
 	account := new(config.Account)
 	var err error
 	if rawJSON, ok := fetcher.FileSystem.Directories["accounts"].Files[accountID]; ok {
@@ -44,7 +47,7 @@ func (fetcher *eagerFetcher) FetchAccount(ctx context.Context, accountID string)
 		err = fmt.Errorf("Account %s not found", accountID)
 	}
 	if err != nil {
-		account = &config.UnknownAccount
+		account = nil
 	}
 	return account, err
 }

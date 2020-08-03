@@ -1286,24 +1286,27 @@ func effectivePubID(pub *openrtb.Publisher) string {
 }
 
 func (deps *endpointDeps) validateAccount(ctx context.Context, pubID string) (*config.Account, error) {
-	var err error = nil
-	var account *config.Account
-	if pubID == pbsmetrics.PublisherUnknown {
-		account = &config.UnknownAccount
-	} else {
-		account, err = deps.acccounts.FetchAccount(ctx, pubID)
+	if _, found := deps.cfg.BlacklistedAcctMap[pubID]; found {
+		return nil, error(&errortypes.BlacklistedAcct{
+			Message: fmt.Sprintf("Prebid-server has disabled Account ID: %s, please reach out to the prebid server host.", pubID),
+		})
 	}
-	if account.Disabled {
-		if account.ID == config.UnknownAccount.ID {
+	var account *config.Account
+	var err error
+	if account, err = deps.acccounts.FetchAccount(ctx, pubID); err != nil || account == nil {
+		account = &deps.cfg.DefaultAccount
+		if account.Disabled {
 			err = error(&errortypes.AcctRequired{
 				Message: fmt.Sprintf("Prebid-server has been configured to discard requests that don't come with an Account ID. Please reach out to the prebid server host."),
 			})
-		} else {
+		}
+	} else {
+		glog.Infof("resolved account for %s -> %+v", pubID, account)
+		if account.Disabled {
 			err = error(&errortypes.BlacklistedAcct{
 				Message: fmt.Sprintf("Prebid-server has disabled Account ID: %s, please reach out to the prebid server host.", pubID),
 			})
 		}
 	}
-	// FIXME: should still check blacklist if we haven't migrated it
 	return account, err
 }

@@ -46,7 +46,7 @@ func (mf MultiFetcher) FetchAccount(ctx context.Context, accountID string) (*con
 			}
 		}
 	}
-	return &config.UnknownAccount, NotFoundError{accountID, "Account"}
+	return nil, NotFoundError{accountID, "Account"}
 }
 
 func (mf MultiFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

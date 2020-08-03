@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/pbsmetrics"
 
 	"github.com/stretchr/testify/assert"
@@ -213,6 +214,10 @@ type mockFetcher struct {
 func (f *mockFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (map[string]json.RawMessage, map[string]json.RawMessage, []error) {
 	args := f.Called(ctx, requestIDs, impIDs)
 	return args.Get(0).(map[string]json.RawMessage), args.Get(1).(map[string]json.RawMessage), args.Get(2).([]error)
+}
+
+func (a *mockFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
+	return nil, nil
 }
 
 func (f *mockFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

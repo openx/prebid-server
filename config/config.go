@@ -518,7 +518,7 @@ func New(v *viper.Viper) (*Configuration, error) {
 	c.DefaultAccount.CCPA = c.CCPA
 
 	if len(c.GDPR.NonStandardPublishers) > 0 {
-		glog.Fatalf("gdpr.non_standard_publishers has been deprecated; use per-account gdpr.enabled=false setting instead")
+		glog.Warningf("gdpr.non_standard_publishers has been deprecated; use per-account gdpr.enabled=false setting instead")
 	}
 	// To look for a request's publisher_id in the NonStandardPublishers list in
 	// O(1) time, we fill this hash table located in the NonStandardPublisherMap field of GDPR
@@ -535,7 +535,7 @@ func New(v *viper.Viper) (*Configuration, error) {
 	}
 
 	if len(c.BlacklistedAccts) > 0 && c.BlacklistedAccts[0] != "" {
-		glog.Fatalf("blacklisted_accts has been deprecated; use per-account disabled=true setting or global account_required=true instead. %d", len(c.BlacklistedAccts))
+		glog.Warningf("blacklisted_accts has been deprecated; use per-account disabled=true setting or global account_required=true instead. %d", len(c.BlacklistedAccts))
 	}
 	// To look for a request's account id in O(1) time, we fill this hash table located in the
 	// the BlacklistedAccts field of the Configuration struct defined in this file

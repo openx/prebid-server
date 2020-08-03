@@ -30,7 +30,7 @@ func (fetcher EmptyFetcher) FetchRequests(ctx context.Context, requestIDs []stri
 }
 
 func (fetcher EmptyFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
-	return &config.UnknownAccount, nil
+	return nil, nil
 }
 
 func (fetcher EmptyFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {

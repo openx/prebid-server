@@ -20,10 +20,3 @@ type PubAnalytics struct {
 type Events struct {
 	Enabled bool `mapstructure:"enabled" json:"enabled"`
 }
-
-// UnknownAccount has settings that apply to unrecognized or missing accounts
-var UnknownAccount = Account{
-	ID: "", // pbsmetrics.PublisherUnknown,
-	// global setting account_required should be moved here
-	Disabled: true,
-}

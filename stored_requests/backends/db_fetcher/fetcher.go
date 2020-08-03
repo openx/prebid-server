@@ -95,7 +95,7 @@ func (fetcher *dbFetcher) FetchRequests(ctx context.Context, requestIDs []string
 }
 
 func (fetcher *dbFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
-	return &config.UnknownAccount, nil
+	return nil, nil
 }
 
 func (fetcher *dbFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {
