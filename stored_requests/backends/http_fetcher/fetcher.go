@@ -82,8 +82,47 @@ func (fetcher *HttpFetcher) FetchRequests(ctx context.Context, requestIDs []stri
 	return
 }
 
+// FetchAccount retrieves an account configuration
+//
+// Request format is similar to the one for requests:
+// GET {endpoint}?account=["<accountID>"]
+//
+// The endpoint is expected to respond with a JSON map with accountID -> accountObject
+// {
+//   "<accountID>": { ... account data ... }
+// }
 func (fetcher *HttpFetcher) FetchAccount(ctx context.Context, accountID string) (*config.Account, error) {
-	return nil, nil
+	if len(accountID) == 0 {
+		return nil, nil
+	}
+	httpReq, err := http.NewRequest("GET", fmt.Sprintf(`account=["%s"]`, accountID), nil)
+	if err != nil {
+		return nil, fmt.Errorf(`Error fetching account "%s" via http: build request failed`, accountID)
+	}
+	httpResp, err := ctxhttp.Do(ctx, fetcher.client, httpReq)
+	if err != nil {
+		return nil, fmt.Errorf(`Error fetching account "%s" via http: request failed`, accountID)
+	}
+	defer httpResp.Body.Close()
+	respBytes, err := ioutil.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf(`Error fetching account "%s" via http: could not read response`, accountID)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(`Error fetching account "%s" via http: unexpected response status %d`, accountID, httpResp.StatusCode)
+	}
+	var accounts accountsResponseContract
+	if err = json.Unmarshal(respBytes, &accounts); err != nil {
+		return nil, fmt.Errorf(`Error fetching account "%s" via http: malformed response`, accountID)
+	}
+	account, ok := accounts.Accounts[accountID]
+	if !ok {
+		return nil, stored_requests.NotFoundError{
+			ID:       accountID,
+			DataType: "Account",
+		}
+	}
+	return &account, nil
 }
 
 func (fetcher *HttpFetcher) FetchCategories(ctx context.Context, primaryAdServer, publisherId, iabCategory string) (string, error) {
@@ -190,4 +229,8 @@ func convertNullsToErrs(m map[string]json.RawMessage, dataType string, errs []er
 type responseContract struct {
 	Requests map[string]json.RawMessage `json:"requests"`
 	Imps     map[string]json.RawMessage `json:"imps"`
+}
+
+type accountsResponseContract struct {
+	Accounts map[string]config.Account `json:"accounts"`
 }
