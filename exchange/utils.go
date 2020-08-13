@@ -52,6 +52,7 @@ func cleanOpenRTBRequests(ctx context.Context,
 	usersyncs IdFetcher,
 	blables map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels,
 	labels pbsmetrics.Labels,
+	account *config.Account,
 	gDPR gdpr.Permissions,
 	usersyncIfAmbiguous bool,
 	privacyConfig config.Privacy) (requestsByBidder map[openrtb_ext.BidderName]*openrtb.BidRequest, aliases map[string]string, privacyLabels pbsmetrics.PrivacyLabels, errs []error) {
@@ -109,8 +110,7 @@ func cleanOpenRTBRequests(ctx context.Context,
 		if gdpr == 1 {
 			coreBidder := resolveBidder(bidder.String(), aliases)
 
-			var publisherID = labels.PubID
-			ok, geo, err := gDPR.PersonalInfoAllowed(ctx, coreBidder, publisherID, consent)
+			ok, geo, err := gDPR.PersonalInfoAllowed(ctx, coreBidder, account, consent)
 			privacyEnforcement.GDPR = !ok && err == nil
 			privacyEnforcement.GDPRGeo = !geo && err == nil
 		} else {

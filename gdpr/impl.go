@@ -42,8 +42,11 @@ func (p *permissionsImpl) BidderSyncAllowed(ctx context.Context, bidder openrtb_
 	return false, nil
 }
 
-func (p *permissionsImpl) PersonalInfoAllowed(ctx context.Context, bidder openrtb_ext.BidderName, PublisherID string, consent string) (bool, bool, error) {
-	_, ok := p.cfg.NonStandardPublisherMap[PublisherID]
+func (p *permissionsImpl) PersonalInfoAllowed(ctx context.Context, bidder openrtb_ext.BidderName, account *config.Account, consent string) (bool, bool, error) {
+	if account.GDPR.Enabled == false {
+		return true, true, nil
+	}
+	_, ok := p.cfg.NonStandardPublisherMap[account.ID]
 	if ok {
 		return true, true, nil
 	}
@@ -214,7 +217,7 @@ func (a AlwaysAllow) BidderSyncAllowed(ctx context.Context, bidder openrtb_ext.B
 	return true, nil
 }
 
-func (a AlwaysAllow) PersonalInfoAllowed(ctx context.Context, bidder openrtb_ext.BidderName, PublisherID string, consent string) (bool, bool, error) {
+func (a AlwaysAllow) PersonalInfoAllowed(ctx context.Context, bidder openrtb_ext.BidderName, account *config.Account, consent string) (bool, bool, error) {
 	return true, true, nil
 }
 
