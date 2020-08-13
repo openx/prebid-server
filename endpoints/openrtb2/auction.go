@@ -82,7 +82,7 @@ type endpointDeps struct {
 	paramsValidator           openrtb_ext.BidderParamValidator
 	storedReqFetcher          stored_requests.Fetcher
 	videoFetcher              stored_requests.Fetcher
-	acccounts                 stored_requests.AccountFetcher
+	accounts                  stored_requests.AccountFetcher
 	categories                stored_requests.CategoryFetcher
 	cfg                       *config.Configuration
 	metricsEngine             pbsmetrics.MetricsEngine
@@ -154,14 +154,14 @@ func (deps *endpointDeps) Auction(w http.ResponseWriter, r *http.Request, _ http
 		labels.PubID = effectivePubID(req.Site.Publisher)
 	}
 
-	_, acctIdErr := deps.validateAccount(ctx, labels.PubID)
+	account, acctIdErr := deps.validateAccount(ctx, labels.PubID)
 	if acctIdErr != nil {
 		errL = append(errL, acctIdErr)
 		writeError(errL, w, &labels)
 		return
 	}
 
-	response, err := deps.ex.HoldAuction(ctx, req, usersyncs, labels, &deps.categories, nil)
+	response, err := deps.ex.HoldAuction(ctx, req, usersyncs, labels, account, &deps.categories, nil)
 	ao.Request = req
 	ao.Response = response
 	if err != nil {
@@ -1293,13 +1293,18 @@ func (deps *endpointDeps) validateAccount(ctx context.Context, pubID string) (*c
 	}
 	var account *config.Account
 	var err error
-	if account, err = deps.acccounts.FetchAccount(ctx, pubID); err != nil || account == nil {
-		account = &deps.cfg.DefaultAccount
-		if account.Disabled {
+	if account, err = deps.accounts.FetchAccount(ctx, pubID); err != nil || account == nil {
+		if deps.cfg.DefaultAccount.Disabled {
 			err = error(&errortypes.AcctRequired{
 				Message: fmt.Sprintf("Prebid-server has been configured to discard requests that don't come with an Account ID. Please reach out to the prebid server host."),
 			})
 		}
+		// We have an unknown account, so use the DefaultAccount
+		// Transitional: make a copy of DefaultAccount instead of taking a reference,
+		// because the pubID is needed to check NonStandardPublisherMap in gdpr/impl.go
+		pubAccount := deps.cfg.DefaultAccount
+		pubAccount.ID = pubID
+		account = &pubAccount
 	} else {
 		glog.Infof("resolved account for %s -> %+v", pubID, account)
 		if account.Disabled {

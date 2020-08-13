@@ -157,7 +157,7 @@ func (deps *endpointDeps) AmpAuction(w http.ResponseWriter, r *http.Request, _ h
 		labels.CookieFlag = pbsmetrics.CookieFlagYes
 	}
 	labels.PubID = effectivePubID(req.Site.Publisher)
-	_, acctIdErr := deps.validateAccount(ctx, labels.PubID)
+	account, acctIdErr := deps.validateAccount(ctx, labels.PubID)
 	if acctIdErr != nil {
 		errL = append(errL, acctIdErr)
 		errCode := errortypes.ReadCode(acctIdErr)
@@ -175,7 +175,7 @@ func (deps *endpointDeps) AmpAuction(w http.ResponseWriter, r *http.Request, _ h
 		return
 	}
 
-	response, err := deps.ex.HoldAuction(ctx, req, usersyncs, labels, &deps.categories, nil)
+	response, err := deps.ex.HoldAuction(ctx, req, usersyncs, labels, account, &deps.categories, nil)
 	ao.AuctionResponse = response
 
 	if err != nil {

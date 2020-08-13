@@ -512,10 +512,13 @@ func New(v *viper.Viper) (*Configuration, error) {
 		return nil, err
 	}
 
-	// Migrate some settings to default account
+	// Migrate some global settings to default account so they can be overriden by account
+	// TODO: check they weren't already set or in conflict
 	c.DefaultAccount.Disabled = c.AccountRequired
 	c.DefaultAccount.GDPR = c.GDPR.TCF2
 	c.DefaultAccount.CCPA = c.CCPA
+	c.DefaultAccount.LMT = c.LMT
+	c.DefaultAccount.TTL = c.CacheURL.DefaultTTLs
 
 	if len(c.GDPR.NonStandardPublishers) > 0 {
 		glog.Warningf("gdpr.non_standard_publishers has been deprecated; use per-account gdpr.enabled=false setting instead")

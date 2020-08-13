@@ -9,6 +9,7 @@ type Account struct {
 	Events           Events       `mapstructure:"events" json:"events"`
 	CCPA             CCPA         `mapstructure:"ccpa" json:"ccpa"`
 	GDPR             TCF2         `mapstructure:"gdpr" json:"gdpr"`
+	LMT              LMT          `mapstructure:"lmt": json:"lmt"`
 	Analytics        PubAnalytics `mapstructure:"analytics" json:"analytics"`
 }
 

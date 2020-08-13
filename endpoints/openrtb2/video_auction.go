@@ -254,14 +254,14 @@ func (deps *endpointDeps) VideoAuctionEndpoint(w http.ResponseWriter, r *http.Re
 		labels.PubID = effectivePubID(bidReq.Site.Publisher)
 	}
 
-	_, acctIdErr := deps.validateAccount(ctx, labels.PubID)
+	account, acctIdErr := deps.validateAccount(ctx, labels.PubID)
 	if acctIdErr != nil {
 		errL := []error{err}
 		handleError(&labels, w, errL, &vo, &debugLog)
 		return
 	}
 	//execute auction logic
-	response, err := deps.ex.HoldAuction(ctx, bidReq, usersyncs, labels, &deps.categories, &debugLog)
+	response, err := deps.ex.HoldAuction(ctx, bidReq, usersyncs, labels, account, &deps.categories, &debugLog)
 	vo.Request = bidReq
 	vo.Response = response
 	if err != nil {
