@@ -25,12 +25,13 @@ func TestGoodRequests(t *testing.T) {
 	initialValue := map[string]json.RawMessage{id: json.RawMessage(config)}
 	cache.Requests.Save(context.Background(), initialValue)
 	cache.Imps.Save(context.Background(), initialValue)
+	cache.Accounts.Save(context.Background(), initialValue)
 
 	apiEvents, endpoint := NewEventsAPI()
 
 	// create channels to syncronize
-	updateOccurred := make(chan struct{})
-	invalidateOccurred := make(chan struct{})
+	updateOccurred := make(chan struct{}, 3)     // capacity of 3 needed for 1 each of reqs, imps, accounts
+	invalidateOccurred := make(chan struct{}, 3) // capacity of 3 needed for 1 each of reqs, imps, accounts
 	listener := events.NewEventListener(
 		func() { updateOccurred <- struct{}{} },
 		func() { invalidateOccurred <- struct{}{} },

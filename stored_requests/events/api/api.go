@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/julienschmidt/httprouter"
+	"github.com/prebid/prebid-server/config"
 	"github.com/prebid/prebid-server/stored_requests/events"
 )
 
@@ -42,14 +43,16 @@ func (api *eventsAPI) HandleEvent(w http.ResponseWriter, r *http.Request, _ http
 			return
 		}
 
-		var save events.Save
+		var save saveRequestContract
 		if err := json.Unmarshal(body, &save); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("Invalid update.\n"))
 			return
 		}
 
-		api.saves <- save
+		sendSaves(api.saves, config.RequestDataType, save.Requests)
+		sendSaves(api.saves, config.ImpDataType, save.Imps)
+		sendSaves(api.saves, config.AccountDataType, save.Accounts)
 	} else if r.Method == "DELETE" {
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
@@ -58,14 +61,16 @@ func (api *eventsAPI) HandleEvent(w http.ResponseWriter, r *http.Request, _ http
 			return
 		}
 
-		var invalidation events.Invalidation
+		var invalidation invalidationRequestContract
 		if err := json.Unmarshal(body, &invalidation); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("Invalid invalidation.\n"))
 			return
 		}
 
-		api.invalidations <- invalidation
+		sendInvalidations(api.invalidations, config.RequestDataType, invalidation.Requests)
+		sendInvalidations(api.invalidations, config.ImpDataType, invalidation.Imps)
+		sendInvalidations(api.invalidations, config.AccountDataType, invalidation.Accounts)
 	} else {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -77,4 +82,31 @@ func (api *eventsAPI) Invalidations() <-chan events.Invalidation {
 
 func (api *eventsAPI) Saves() <-chan events.Save {
 	return api.saves
+}
+
+func sendInvalidations(invalidations chan<- events.Invalidation, dataType config.DataType, deletedIDs []string) {
+	if len(deletedIDs) > 0 {
+		invalidations <- events.Invalidation{
+			DataType: dataType,
+			Data:     deletedIDs,
+		}
+	}
+}
+
+func sendSaves(saves chan<- events.Save, dataType config.DataType, changes map[string]json.RawMessage) {
+	if len(changes) > 0 {
+		saves <- events.Save{DataType: dataType, Data: changes}
+	}
+}
+
+type saveRequestContract struct {
+	Requests map[string]json.RawMessage `json:"requests"`
+	Imps     map[string]json.RawMessage `json:"imps"`
+	Accounts map[string]json.RawMessage `json:"accounts"`
+}
+
+type invalidationRequestContract struct {
+	Requests []string `json:"requests"`
+	Imps     []string `json:"imps"`
+	Accounts []string `json:"accounts"`
 }
