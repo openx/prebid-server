@@ -20,8 +20,11 @@ type OpenxAdapter struct {
 }
 
 type openxImpExt struct {
-	CustomParams       map[string]interface{}             `json:"customParams,omitempty"`
+	CustomParams       *map[string]interface{}            `json:"customParams,omitempty"`
 	AuctionEnvironment openrtb_ext.AuctionEnvironmentType `json:"ae,omitempty"`
+	Gpid               string                             `json:"gpid,omitempty"`
+	Data               *map[string]interface{}            `json:"data,omitempty"`
+	SkAdn              *map[string]interface{}            `json:"skadn,omitempty"`
 }
 
 type openxReqExt struct {
@@ -118,7 +121,12 @@ func (a *OpenxAdapter) makeRequest(request *openrtb2.BidRequest) (*adapters.Requ
 
 // Mutate the imp to get it ready to send to openx.
 func preprocess(imp *openrtb2.Imp, reqExt *openxReqExt) error {
-	var bidderExt adapters.ExtImpBidder
+	var bidderExt struct {
+		adapters.ExtImpBidder
+		Gpid  string                  `json:"gpid,omitempty"`
+		Data  *map[string]interface{} `json:"data,omitempty"`
+		SkAdn *map[string]interface{} `json:"skadn,omitempty"`
+	}
 	if err := json.Unmarshal(imp.Ext, &bidderExt); err != nil {
 		return &errortypes.BadInput{
 			Message: err.Error(),
@@ -144,11 +152,23 @@ func preprocess(imp *openrtb2.Imp, reqExt *openxReqExt) error {
 	addImpExt := false
 
 	if openxExt.CustomParams != nil {
-		impExt.CustomParams = openxExt.CustomParams
+		impExt.CustomParams = &openxExt.CustomParams
 		addImpExt = true
 	}
 	if bidderExt.AuctionEnvironment != openrtb_ext.ServerSideAuction {
 		impExt.AuctionEnvironment = bidderExt.AuctionEnvironment
+		addImpExt = true
+	}
+	if bidderExt.Gpid != "" {
+		impExt.Gpid = bidderExt.Gpid
+		addImpExt = true
+	}
+	if bidderExt.Data != nil {
+		impExt.Data = bidderExt.Data
+		addImpExt = true
+	}
+	if bidderExt.SkAdn != nil {
+		impExt.SkAdn = bidderExt.SkAdn
 		addImpExt = true
 	}
 	if addImpExt {
